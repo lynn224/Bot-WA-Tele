@@ -1,0 +1,20 @@
+{
+  "name": "wa-tele",
+  "version": "1.0.0",
+  "description": "WhatsApp to Telegram Anti-Delete dengan MongoDB, Queue & Command Center",
+  "main": "index.js",
+  "scripts": {
+    "start": "node --expose-gc index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "6.7.9",
+    "node-telegram-bot-api": "0.66.0",
+    "express": "4.21.0",
+    "pino": "9.4.0",
+    "mongodb": "^6.3.0",
+    "node-cache": "^5.1.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
