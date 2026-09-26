@@ -56,7 +56,7 @@ const antreanPesan = [];
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // =========================================================================
-// MONGODB ADAPTER (Auth State Persisten)
+// MONGODB ADAPTER (Auth State Persisten - NON-BLOCKING & ANTI GAGAL TAUT)
 // =========================================================================
 const mongoClient = new MongoClient(MONGODB_URI);
 let db, authCollection, configCollection;
@@ -110,27 +110,33 @@ async function useMongoDBAuthState() {
                     }));
                     return data;
                 },
-                set: async (data) => {
-                    const tasks = [];
+                // NON-BLOCKING: Fungsi ini dieksekusi di background agar WA tidak timeout saat pairing
+                set: (data) => {
                     for (const category in data) {
                         for (const id in data[category]) {
                             const value = data[category][id];
                             const _id = `${category}-${id}`;
                             if (value) {
-                                tasks.push(authCollection.updateOne({ _id }, { $set: { data: JSON.parse(JSON.stringify(value, BufferJSON.replacer)) } }, { upsert: true }).catch(()=>{}));
+                                authCollection.updateOne(
+                                    { _id }, 
+                                    { $set: { data: JSON.parse(JSON.stringify(value, BufferJSON.replacer)) } }, 
+                                    { upsert: true }
+                                ).catch(()=>{});
                             } else {
-                                tasks.push(authCollection.deleteOne({ _id }).catch(()=>{}));
+                                authCollection.deleteOne({ _id }).catch(()=>{});
                             }
                         }
                     }
-                    await Promise.allSettled(tasks);
                 }
             }
         },
-        saveCreds: async () => {
-            try {
-                await authCollection.updateOne({ _id: 'creds' }, { $set: { data: JSON.parse(JSON.stringify(creds, BufferJSON.replacer)) } }, { upsert: true });
-            } catch (e) {}
+        // NON-BLOCKING
+        saveCreds: () => {
+            authCollection.updateOne(
+                { _id: 'creds' }, 
+                { $set: { data: JSON.parse(JSON.stringify(creds, BufferJSON.replacer)) } }, 
+                { upsert: true }
+            ).catch(()=>{});
         }
     };
 }
@@ -371,7 +377,6 @@ async function mulaiBotWhatsApp() {
         }
     }
 
-    // PAKSA PANGGIL KODE SETELAH 4 DETIK BILA BELUM TERDAFTAR
     if (!sock.authState.creds.registered) {
         setTimeout(() => mintaKodePairing(0), 4000);
     }
@@ -385,7 +390,6 @@ async function mulaiBotWhatsApp() {
             sudahMemintaKode = false;
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             
-            // ABAIKAN ERROR 1006 DARI META DAN LANGSUNG SAMBUNG ULANG
             if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
                 try { await authCollection.deleteMany({}); } catch (e) {}
                 perbaruiStatusTelegram('Logout - perlu pairing ulang', true);
