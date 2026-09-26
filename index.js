@@ -1,4 +1,4 @@
-const { default: makeWASocket, DisconnectReason, downloadContentFromMessage, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, downloadContentFromMessage, initAuthCreds, BufferJSON, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const pino = require('pino');
@@ -271,13 +271,19 @@ async function mulaiBotWhatsApp() {
 
     const { state, saveCreds } = await useMongoDBAuthState();
     
+    // PERBAIKAN KRUSIAL 1: Mengambil versi WA Web terbaru langsung dari server Meta
+    const { version, isLatest } = await fetchLatestBaileysVersion();
+    console.log(`[SYS] Menggunakan WA v${version.join('.')} (Terbaru: ${isLatest})`);
+
     const sock = makeWASocket({
+        version, // Wajib diisi agar Meta tidak menolak permintaan kode
         auth: state,
         logger: pino({ level: 'silent' }), 
+        printQRInTerminal: false, // PERBAIKAN KRUSIAL 2: Matikan paksa fitur QR
         syncFullHistory: true,
-        // SPOOFING: Menyamar sebagai Ubuntu / Chrome yang paling stabil untuk Pairing
-        browser: ['Ubuntu', 'Chrome', '20.0.04'] 
+        browser: ['Mac OS', 'Safari', '10.15.7'] 
     });
+    
     globalSock = sock; 
 
     // BLOK FILTER ACK DINAMIS
@@ -304,31 +310,38 @@ async function mulaiBotWhatsApp() {
         sedangSinkronisasi = false;
     });
 
-    // SISTEM PENGHASIL KODE PAIRING
+    // SISTEM PENGHASIL KODE PAIRING (DENGAN PENANGKAP ERROR)
     if (!sock.authState.creds.registered && !sedangMenungguPairing) {
         sedangMenungguPairing = true;
         
-        tgBot.sendMessage(TG_GROUP_ID, `⏳ *Menghubungkan ke server Meta...*`, { parse_mode: 'Markdown' });
+        const cleanNumber = nomorWaUtama.replace(/[^0-9]/g, '');
+        tgBot.sendMessage(TG_GROUP_ID, `⏳ *Menghubungkan ke Meta (v${version.join('.')})...*`, { parse_mode: 'Markdown' });
 
-        // Delay dikurangi jadi 6 detik (Batas aman sebelum koneksi terputus otomatis)
         setTimeout(async () => {
             try {
-                const kodePairing = await sock.requestPairingCode(nomorWaUtama);
-                tgBot.sendMessage(TG_GROUP_ID, `⚠️ **KODE PAIRING BARU:** \`${kodePairing}\`\nNomor: ${nomorWaUtama}\n\n_Auto-restart dalam 3 menit jika gagal ditautkan._`, { parse_mode: 'Markdown' });
+                const kodePairing = await sock.requestPairingCode(cleanNumber);
+                tgBot.sendMessage(TG_GROUP_ID, `⚠️ **KODE PAIRING BARU:** \`${kodePairing}\`\nNomor: ${cleanNumber}\n\n_Auto-restart dalam 3 menit jika gagal._`, { parse_mode: 'Markdown' });
                 
-                // Timer Siklus Ulang (3 Menit)
                 setTimeout(() => {
                     if (globalSock && !sock.authState.creds.registered && !global.mesinBerhenti) {
-                        tgBot.sendMessage(TG_GROUP_ID, `🔄 Waktu tautan habis. Memancing kode baru...`);
+                        tgBot.sendMessage(TG_GROUP_ID, `🔄 Waktu tautan habis. Merestart mesin...`);
                         process.exit(1); 
                     }
                 }, 180000); 
 
             } catch (err) { 
                 sedangMenungguPairing = false;
-                tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal mengambil kode. Menunggu restart otomatis...`);
+                // PERBAIKAN KRUSIAL 3: Mencetak alasan asli penolakan
+                const errorMsg = err.message || 'Tidak diketahui';
+                console.error('[PAIRING ERROR]', err);
+                
+                if (errorMsg.includes('429') || errorMsg.includes('rate-overlimit')) {
+                    tgBot.sendMessage(TG_GROUP_ID, `❌ **DIBLOKIR SEMENTARA (Error 429)**\nIP Render Anda sedang dibatasi oleh Meta karena terlalu sering meminta kode. Harap matikan bot (ketik \`/stop\`) dan tunggu 1-2 jam sebelum mencoba \`/start\` kembali.`);
+                } else {
+                    tgBot.sendMessage(TG_GROUP_ID, `❌ **Gagal mengambil kode:**\n\`${errorMsg}\`\nMesin akan mencoba ulang...`, { parse_mode: 'Markdown' });
+                }
             }
-        }, 6000); 
+        }, 5000); 
     }
 
     sock.ev.on('connection.update', async (update) => {
@@ -383,7 +396,7 @@ async function mulaiBotWhatsApp() {
 }
 
 // =========================================================================
-// EXPRESS SERVER & AUTO GARBAGE COLLECTOR
+// EXPRESS SERVER
 // =========================================================================
 setInterval(() => {
     if (global.gc) global.gc();
@@ -393,7 +406,7 @@ setInterval(() => {
 }, 120000);
 
 const app = express();
-app.get('/', (req, res) => res.send('WhatsApp Command Center - Aktif 24 Jam.'));
+app.get('/', (req, res) => res.send('WhatsApp Command Center - Aktif.'));
 
 process.on('SIGTERM', async () => {
     console.log('[SYS] Sinyal Shutdown Diterima.');
