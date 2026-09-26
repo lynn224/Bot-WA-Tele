@@ -6,7 +6,7 @@ const NodeCache = require('node-cache');
 const { MongoClient } = require('mongodb');
 
 // =========================================================================
-// KONFIGURASI LINGKUNGAN (ENVIRONMENT VARIABLES)
+// KONFIGURASI LINGKUNGAN
 // =========================================================================
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_GROUP_ID = process.env.TG_GROUP_ID;
@@ -16,18 +16,16 @@ let nomorWaUtama = process.env.NOMOR_WA_UTAMA;
 const MAX_FILE_SIZE_MB = 5;
 const tgBot = new TelegramBot(TG_TOKEN, { polling: true }); 
 
-// CACHE & MEMORI PROTECTOR
 const cacheAntiSpam = new NodeCache({ stdTTL: 3600 }); 
 const cacheAntiDelete = new NodeCache({ stdTTL: 86400 }); 
 
-// VARIABEL GLOBAL MESIN & STATUS
 let globalSock = null;
 let sedangMenungguPairing = false;
 let topikDatabase = {};
 let idPesanStatus = null;
 
 global.stealthMode = true; 
-global.mesinBerhenti = false; // Saklar daya dari Telegram
+global.mesinBerhenti = false; 
 
 let statusHpSaatIni = 'Offline'; 
 let waktuTerakhirAktif = 0; 
@@ -36,7 +34,7 @@ let sedangSinkronisasi = false;
 const antreanPesan = [];
 
 // =========================================================================
-// KONEKSI MONGODB & AUTH ADAPTER
+// MONGODB ADAPTER
 // =========================================================================
 const mongoClient = new MongoClient(MONGODB_URI);
 let db, authCollection, configCollection;
@@ -110,7 +108,7 @@ async function useMongoDBAuthState() {
 }
 
 // =========================================================================
-// COMMAND CENTER TELEGRAM & LIVE STATUS
+// COMMAND CENTER TELEGRAM
 // =========================================================================
 async function perbaruiStatusTelegram(statusBaru) {
     if (statusHpSaatIni === statusBaru && idPesanStatus && antreanPesan.length === 0 && !sedangSinkronisasi) return;
@@ -138,20 +136,19 @@ tgBot.on('message', async (msg) => {
     const threadId = msg.message_thread_id;
 
     if (teks === '/help') {
-        const help = `🛠️ **MENU COMMAND**\n/status - Diagnostik server\n/siluman [on/off] - Saklar Centang 1\n/kirim [nomor] [pesan] - Kirim WA Baru\n/gantiwa [nomor] - Ganti Nomor Utama\n/stop - Matikan mesin WA sementara\n/start - Nyalakan mesin WA kembali\n/restart - Muat ulang (Reboot) server`;
+        const help = `🛠️ **MENU**\n/status - Diagnostik\n/siluman [on/off] - Mode Centang 1\n/kirim [no] [pesan] - Kirim WA\n/gantiwa [no] - Ganti Nomor\n/stop - Matikan WA\n/start - Nyalakan WA\n/restart - Reboot Server`;
         return tgBot.sendMessage(TG_GROUP_ID, help, { message_thread_id: threadId });
     }
 
-    // KONTROL DAYA: STOP / START / RESTART
     if (teks === '/stop') {
         global.mesinBerhenti = true;
-        if (globalSock) globalSock.end(); // Memutuskan koneksi tanpa menghapus sesi
+        if (globalSock) globalSock.end();
         perbaruiStatusTelegram('Offline');
-        return tgBot.sendMessage(TG_GROUP_ID, '🛑 **Mesin WA dimatikan.**\nKetik `/start` jika ingin menghidupkannya kembali.', { message_thread_id: threadId, parse_mode: 'Markdown' });
+        return tgBot.sendMessage(TG_GROUP_ID, '🛑 **Mesin WA dimatikan.**\nKetik `/start` untuk menghidupkan.', { message_thread_id: threadId, parse_mode: 'Markdown' });
     }
 
     if (teks === '/start') {
-        if (!global.mesinBerhenti) return tgBot.sendMessage(TG_GROUP_ID, '⚠️ Mesin sudah dalam keadaan berjalan.', { message_thread_id: threadId });
+        if (!global.mesinBerhenti) return tgBot.sendMessage(TG_GROUP_ID, '⚠️ Mesin sudah nyala.', { message_thread_id: threadId });
         global.mesinBerhenti = false;
         tgBot.sendMessage(TG_GROUP_ID, '✅ **Menyalakan ulang mesin WA...**', { message_thread_id: threadId, parse_mode: 'Markdown' });
         mulaiBotWhatsApp();
@@ -159,11 +156,10 @@ tgBot.on('message', async (msg) => {
     }
 
     if (teks === '/restart') {
-        await tgBot.sendMessage(TG_GROUP_ID, `🔄 Memulai ulang server Render secara paksa...`, { message_thread_id: threadId });
+        await tgBot.sendMessage(TG_GROUP_ID, `🔄 Memulai ulang server...`, { message_thread_id: threadId });
         process.exit(1); 
     }
 
-    // KONTROL LAINNYA
     if (teks === '/status') {
         const ram = (process.memoryUsage().rss / 1024 / 1024).toFixed(2);
         return tgBot.sendMessage(TG_GROUP_ID, `📊 RAM: ${ram} MB\n🔌 WA: ${globalSock ? 'Konek' : 'Putus'}\n📥 Antrean: ${antreanPesan.length}`, { message_thread_id: threadId });
@@ -180,14 +176,14 @@ tgBot.on('message', async (msg) => {
     }
 
     if (teks.startsWith('/kirim ')) {
-        if (!globalSock) return tgBot.sendMessage(TG_GROUP_ID, '⚠️ WA belum siap atau sedang dihentikan!', { message_thread_id: threadId });
+        if (!globalSock) return tgBot.sendMessage(TG_GROUP_ID, '⚠️ WA belum siap!', { message_thread_id: threadId });
         const parts = teks.split(' ');
         let noTujuan = parts[1].replace(/[^0-9]/g, '') + '@s.whatsapp.net';
         const isi = parts.slice(2).join(' ');
         try {
             await globalSock.sendMessage(noTujuan, { text: isi });
             tgBot.sendMessage(TG_GROUP_ID, `✅ Terkirim!`, { message_thread_id: threadId });
-        } catch (e) { tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal: ${e.message}`, { message_thread_id: threadId }); }
+        } catch (e) {}
     }
 
     if (teks.startsWith('/gantiwa ')) {
@@ -209,7 +205,7 @@ tgBot.on('message', async (msg) => {
 });
 
 // =========================================================================
-// SISTEM ANTREAN TUNGGAL (FIFO QUEUE WORKER)
+// SISTEM ANTREAN TUNGGAL
 // =========================================================================
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -268,7 +264,7 @@ async function eksekusiKirimKeTelegram(infoPesan, isHistory) {
 }
 
 // =========================================================================
-// MESIN WHATSAPP UTAMA DENGAN SPOOFING & DELAY
+// MESIN WHATSAPP UTAMA 
 // =========================================================================
 async function mulaiBotWhatsApp() {
     if (global.mesinBerhenti) return;
@@ -279,12 +275,12 @@ async function mulaiBotWhatsApp() {
         auth: state,
         logger: pino({ level: 'silent' }), 
         syncFullHistory: true,
-        // SPOOFING: Menyamar Sebagai Apple Mac OS agar lolos dari blokir IP Meta
-        browser: ['Mac OS', 'Safari', '10.15.7'] 
+        // SPOOFING: Menyamar sebagai Ubuntu / Chrome yang paling stabil untuk Pairing
+        browser: ['Ubuntu', 'Chrome', '20.0.04'] 
     });
     globalSock = sock; 
 
-    // BLOK FILTER ACK DINAMIS (CENTANG 1)
+    // BLOK FILTER ACK DINAMIS
     if (typeof sock.sendNode === 'function') {
         const eksekusiAsliSendNode = sock.sendNode;
         sock.sendNode = function (node) {
@@ -295,7 +291,6 @@ async function mulaiBotWhatsApp() {
         };
     }
 
-    // PENANGANAN RIWAYAT LAMA (Disortir Kronologis)
     sock.ev.on('messaging-history.set', async ({ messages }) => { 
         if (!messages || messages.length === 0) return;
         sedangSinkronisasi = true;
@@ -309,35 +304,37 @@ async function mulaiBotWhatsApp() {
         sedangSinkronisasi = false;
     });
 
-    // SISTEM PENGHASIL KODE PAIRING (DELAY 30 DETIK & AUTO-RETRY)
+    // SISTEM PENGHASIL KODE PAIRING
     if (!sock.authState.creds.registered && !sedangMenungguPairing) {
         sedangMenungguPairing = true;
         
-        tgBot.sendMessage(TG_GROUP_ID, `⏳ *Mempersiapkan pembuatan Kode Pairing... (Delay 30 detik untuk bypass keamanan)*`, { parse_mode: 'Markdown' });
+        tgBot.sendMessage(TG_GROUP_ID, `⏳ *Menghubungkan ke server Meta...*`, { parse_mode: 'Markdown' });
 
-        // Delay 30 Detik sesuai permintaan Anda
+        // Delay dikurangi jadi 6 detik (Batas aman sebelum koneksi terputus otomatis)
         setTimeout(async () => {
             try {
                 const kodePairing = await sock.requestPairingCode(nomorWaUtama);
-                tgBot.sendMessage(TG_GROUP_ID, `⚠️ **KODE PAIRING BARU:** \`${kodePairing}\`\nNomor: ${nomorWaUtama}\n\n_Jika kode ini tidak ditautkan/gagal dalam 3 menit, bot akan otomatis membuangnya dan membuat kode baru._`, { parse_mode: 'Markdown' });
+                tgBot.sendMessage(TG_GROUP_ID, `⚠️ **KODE PAIRING BARU:** \`${kodePairing}\`\nNomor: ${nomorWaUtama}\n\n_Auto-restart dalam 3 menit jika gagal ditautkan._`, { parse_mode: 'Markdown' });
                 
                 // Timer Siklus Ulang (3 Menit)
                 setTimeout(() => {
                     if (globalSock && !sock.authState.creds.registered && !global.mesinBerhenti) {
-                        tgBot.sendMessage(TG_GROUP_ID, `🔄 Waktu tautan habis / Gagal ditautkan. Meminta kode baru...`);
-                        process.exit(1); // Merestart mesin untuk memancing kode baru
+                        tgBot.sendMessage(TG_GROUP_ID, `🔄 Waktu tautan habis. Memancing kode baru...`);
+                        process.exit(1); 
                     }
                 }, 180000); 
 
-            } catch (err) { sedangMenungguPairing = false; }
-        }, 30000); 
+            } catch (err) { 
+                sedangMenungguPairing = false;
+                tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal mengambil kode. Menunggu restart otomatis...`);
+            }
+        }, 6000); 
     }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
         if (connection === 'close') {
             globalSock = null; 
-            // Jangan reconnect jika dimatikan sengaja lewat /stop
             if (!global.mesinBerhenti && (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut) {
                 mulaiBotWhatsApp();
             }
@@ -350,7 +347,6 @@ async function mulaiBotWhatsApp() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // PENANGANAN PESAN BARU
     sock.ev.on('messages.upsert', async (chatUpdate) => {
         const infoPesan = chatUpdate.messages[0];
         if (!infoPesan || !infoPesan.message) return;
