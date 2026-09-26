@@ -36,11 +36,12 @@ if (!TG_TOKEN || !TG_GROUP_ID || !MONGODB_URI || !nomorWaUtama) {
     process.exit(1);
 }
 
-// Tambahkan opsi 'request' khusus jika Telegram sering ECONNABORTED
+// Menjinakkan Error Jaringan Telegram
 const tgBot = new TelegramBot(TG_TOKEN, { 
     polling: true,
-    request: { timeout: 30000 } // Toleransi waktu lebih lama untuk jaringan lambat
+    request: { timeout: 30000 } 
 });
+tgBot.on('polling_error', () => {}); // Bungkam pesan error EFATAL dari Telegram
 
 const cacheAntiSpam = new NodeCache({ stdTTL: 3600 });
 const cacheAntiDelete = new NodeCache({ stdTTL: 86400 });
@@ -98,7 +99,6 @@ async function prepareHybridSession() {
     const sessionDir = 'session_baileys';
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
 
-    // 1. Download dari DB ke Lokal (Dengan Penangkal ECONNABORTED)
     try {
         const dbDocs = await authCollection.find({}).toArray();
         if (dbDocs.length > 0) {
@@ -110,10 +110,8 @@ async function prepareHybridSession() {
         console.log('[WARN] Jaringan tidak stabil saat membaca DB. Sesi akan mengandalkan file lokal...');
     }
 
-    // 2. Gunakan Mesin Lokal Baileys (0 detik ping, anti gagal pairing)
     const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
 
-    // 3. Fungsi Upload Diam-Diam
     const syncToCloud = async () => {
         try {
             const files = fs.readdirSync(sessionDir);
@@ -132,7 +130,6 @@ async function prepareHybridSession() {
         } catch (e) {}
     };
 
-    // Otomatis amankan kunci ke server tiap 2 menit
     setInterval(syncToCloud, 120000);
 
     return { state, saveCreds, syncToCloud };
@@ -293,7 +290,7 @@ async function mulaiBotWhatsApp() {
         auth: state, 
         printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
-        browser: Browsers.macOS('Desktop'), // Wajib agar tidak ditolak Meta
+        browser: Browsers.macOS('Desktop'),
         connectTimeoutMs: 60000,
         emitOwnEvents: true,
         markOnlineOnConnect: true,
@@ -352,17 +349,24 @@ async function mulaiBotWhatsApp() {
             sudahMemintaKode = true;
             const cleanNumber = nomorWaUtama.replace(/[^0-9]/g, '');
 
+            console.log(`[SYS] Sedang meminta kode untuk nomor: ${cleanNumber}...`);
+
             let kodePairing = await sock.requestPairingCode(cleanNumber);
             kodePairing = kodePairing?.match(/.{1,4}/g)?.join('-') || kodePairing;
             
             console.log(`\n==============================================`);
             console.log(`🔑 KODE PAIRING ANDA: ${kodePairing}`);
+            console.log(`📱 Untuk Nomor: ${cleanNumber}`);
             console.log(`==============================================\n`);
 
-            await tgBot.sendMessage(TG_GROUP_ID, `⚠️ *KODE PAIRING:* \`${kodePairing}\`\nMasukkan kode ini di HP Anda.`, { parse_mode: 'Markdown' });
+            await tgBot.sendMessage(TG_GROUP_ID, `⚠️ *KODE PAIRING:* \`${kodePairing}\`\nNomor: ${cleanNumber}\n\nMasukkan kode ini di HP Anda.`, { parse_mode: 'Markdown' }).catch(()=>{});
         } catch (err) {
             sudahMemintaKode = false; 
-            if (retryCount < 3) setTimeout(() => mintaKodePairing(retryCount + 1), 5000);
+            console.log(`[ERROR WA] Gagal meminta kode:`, err.message);
+            if (retryCount < 5) {
+                console.log(`[SYS] Mencoba lagi dalam 5 detik... (Percobaan ${retryCount + 1}/5)`);
+                setTimeout(() => mintaKodePairing(retryCount + 1), 5000);
+            }
         }
     }
 
@@ -393,7 +397,7 @@ async function mulaiBotWhatsApp() {
             sedangMenungguPairing = false;
             perbaruiStatusTelegram('Online');
             console.log('\n✅ BERHASIL TAUTAN! Menyinkronkan kunci ke Cloud...\n');
-            await syncToCloud(); // Kunci lokal langsung diunggah ke MongoDB
+            await syncToCloud(); 
         }
     });
 
