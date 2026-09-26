@@ -8,15 +8,16 @@ const {
     default: makeWASocket,
     DisconnectReason,
     downloadContentFromMessage,
-    initAuthCreds,
-    BufferJSON,
-    fetchLatestBaileysVersion
+    useMultiFileAuthState,
+    fetchLatestBaileysVersion,
+    Browsers
 } = require('@whiskeysockets/baileys');
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const pino = require('pino');
 const NodeCache = require('node-cache');
 const { MongoClient } = require('mongodb');
+const fs = require('fs');
 
 // =========================================================================
 // KONFIGURASI LINGKUNGAN
@@ -56,7 +57,7 @@ const antreanPesan = [];
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // =========================================================================
-// MONGODB ADAPTER (SISTEM BULK-WRITE: TAHAN BANTING UNTUK PAIRING)
+// MONGODB ADAPTER (HYBRID SYSTEM: LOKAL CEPAT -> CLOUD)
 // =========================================================================
 const mongoClient = new MongoClient(MONGODB_URI);
 let db, authCollection, configCollection;
@@ -66,7 +67,6 @@ async function hubungkanDatabase() {
     db = mongoClient.db('wa_backup_db');
     authCollection = db.collection('auth_sessions');
     configCollection = db.collection('bot_config');
-
     console.log('[DB] MongoDB berhasil terhubung.');
 
     const config = await configCollection.findOne({ _id: 'global_settings' });
@@ -88,80 +88,43 @@ async function simpanKonfigurasiDB() {
     } catch (e) {}
 }
 
-async function useMongoDBAuthState() {
-    let creds;
-    try {
-        const doc = await authCollection.findOne({ _id: 'creds' });
-        if (doc) creds = JSON.parse(JSON.stringify(doc.data), BufferJSON.reviver);
-        else creds = initAuthCreds();
-    } catch (e) { creds = initAuthCreds(); }
+// ARSITEKTUR HYBRID: Menyelamatkan nyawa bot saat pairing
+async function prepareHybridSession() {
+    const sessionDir = 'session_baileys';
+    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
 
-    const memoryBuffer = {}; 
-    let saveTimer = null;
-
-    const eksekusiBulkWrite = async () => {
-        if (Object.keys(memoryBuffer).length === 0) return;
-        
-        const operations = [];
-        for (const key in memoryBuffer) {
-            const value = memoryBuffer[key];
-            if (value === null) {
-                operations.push({ deleteOne: { filter: { _id: key } } });
-            } else {
-                operations.push({
-                    updateOne: {
-                        filter: { _id: key },
-                        update: { $set: { data: JSON.parse(JSON.stringify(value, BufferJSON.replacer)) } },
-                        upsert: true
-                    }
-                });
-            }
+    // 1. Download dari DB ke Lokal (Penting saat Render baru menyala)
+    const dbDocs = await authCollection.find({}).toArray();
+    if (dbDocs.length > 0) {
+        for (const doc of dbDocs) {
+            fs.writeFileSync(`${sessionDir}/${doc._id}.json`, JSON.stringify(doc.data));
         }
+    }
 
+    // 2. Gunakan Mesin Lokal Baileys (Super Cepat, Bebas Timeout)
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+
+    // 3. Fungsi Diam-Diam Upload ke MongoDB
+    const syncToCloud = async () => {
         try {
-            await authCollection.bulkWrite(operations);
-            for (const key in memoryBuffer) delete memoryBuffer[key]; // Kosongkan memori setelah terkirim
-        } catch (e) {
-            console.log('[WARN] Gagal bulkWrite, akan dicoba lagi otomatis...');
-        }
-    };
-
-    return {
-        state: {
-            creds,
-            keys: {
-                get: async (type, ids) => {
-                    const data = {};
-                    await Promise.all(ids.map(async (id) => {
-                        const _id = `${type}-${id}`;
-                        if (memoryBuffer[_id] !== undefined) {
-                            data[id] = memoryBuffer[_id];
-                        } else {
-                            try {
-                                const rec = await authCollection.findOne({ _id });
-                                if (rec) data[id] = JSON.parse(JSON.stringify(rec.data), BufferJSON.reviver);
-                            } catch (err) {}
-                        }
-                    }));
-                    return data;
-                },
-                set: (data) => {
-                    for (const category in data) {
-                        for (const id in data[category]) {
-                            const value = data[category][id];
-                            const _id = `${category}-${id}`;
-                            memoryBuffer[_id] = value || null; 
-                        }
-                    }
-                    if (saveTimer) clearTimeout(saveTimer);
-                    saveTimer = setTimeout(eksekusiBulkWrite, 2000); // Kirim rombongan setiap 2 detik
+            const files = fs.readdirSync(sessionDir);
+            const operations = [];
+            for (const file of files) {
+                if (file.endsWith('.json')) {
+                    const _id = file.replace('.json', '');
+                    const rawText = fs.readFileSync(`${sessionDir}/${file}`, 'utf-8');
+                    const data = JSON.parse(rawText);
+                    operations.push({ updateOne: { filter: { _id }, update: { $set: { data } }, upsert: true } });
                 }
             }
-        },
-        saveCreds: () => {
-            authCollection.updateOne({ _id: 'creds' }, { $set: { data: JSON.parse(JSON.stringify(creds, BufferJSON.replacer)) } }, { upsert: true }).catch(()=>{});
-        }
+            if (operations.length > 0) await authCollection.bulkWrite(operations);
+        } catch (e) {}
     };
+
+    // Sinkronisasi otomatis tiap 2 menit
+    setInterval(syncToCloud, 120000);
+
+    return { state, saveCreds, syncToCloud };
 }
 
 // =========================================================================
@@ -192,16 +155,6 @@ tgBot.on('message', async (msg) => {
     const teks = msg.text || '';
     const threadId = msg.message_thread_id;
 
-    if (teks === '/help') {
-        const help = `🛠️ *MENU COMMAND*\n/status - Diagnostik\n/siluman [on/off] - Centang 1\n/kirim [nomor] [pesan] - Kirim WA\n/gantiwa [nomor] - Ganti nomor\n/restart - Restart`;
-        return tgBot.sendMessage(TG_GROUP_ID, help, { message_thread_id: threadId, parse_mode: 'Markdown' });
-    }
-
-    if (teks === '/status') {
-        const ram = (process.memoryUsage().rss / 1024 / 1024).toFixed(2);
-        return tgBot.sendMessage(TG_GROUP_ID, `📊 RAM: ${ram} MB\n🔌 WA: ${globalSock ? 'Terhubung' : 'Terputus'}`, { message_thread_id: threadId });
-    }
-    
     if (teks.startsWith('/siluman ')) {
         const cmd = teks.split(' ')[1].toLowerCase();
         if (cmd === 'on' || cmd === 'off') {
@@ -211,73 +164,32 @@ tgBot.on('message', async (msg) => {
             return tgBot.sendMessage(TG_GROUP_ID, `✅ Mode Siluman: **${cmd.toUpperCase()}**`, { message_thread_id: threadId, parse_mode: 'Markdown' });
         }
     }
-
-    if (teks.startsWith('/kirim ')) {
-        if (!globalSock) return tgBot.sendMessage(TG_GROUP_ID, '⚠️ WA belum siap.', { message_thread_id: threadId });
-        const parts = teks.split(' ');
-        const noTujuan = parts[1].replace(/[^0-9]/g, '') + '@s.whatsapp.net';
-        const isi = parts.slice(2).join(' ');
-        try {
-            await globalSock.sendMessage(noTujuan, { text: isi });
-            tgBot.sendMessage(TG_GROUP_ID, `✅ Terkirim.`, { message_thread_id: threadId });
-        } catch (e) { tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal: ${e.message}`, { message_thread_id: threadId }); }
-    }
-
-    if (teks.startsWith('/gantiwa ')) {
-        const parts = teks.split(' ');
-        const nomorBaru = parts[1].replace(/[^0-9]/g, '');
-        if (!nomorBaru) return;
-
-        await tgBot.sendMessage(TG_GROUP_ID, `🔄 *PROSES GANTI NOMOR*\nTarget: ${nomorBaru}`, { message_thread_id: threadId, parse_mode: 'Markdown' });
-        nomorWaUtama = nomorBaru;
-        await simpanKonfigurasiDB();
-        if (globalSock) { try { await globalSock.logout(); } catch (e) {} }
-        await authCollection.deleteMany({});
-        await delay(2000);
-        process.exit(1); 
-    }
-
-    if (teks === '/restart') {
-        await tgBot.sendMessage(TG_GROUP_ID, `🔄 Memulai ulang server...`, { message_thread_id: threadId });
-        process.exit(1);
-    }
-
-    if (threadId && globalSock && !teks.startsWith('/')) {
-        const wa_id = Object.keys(topikDatabase).find((key) => topikDatabase[key] === threadId);
-        if (wa_id) globalSock.sendMessage(wa_id, { text: teks }).catch(() => {});
-    }
 });
 
 // =========================================================================
-// SISTEM ANTREAN TUNGGAL 
+// SISTEM ANTREAN
 // =========================================================================
 async function masukAntrean(infoPesan, isHistory = false) {
     antreanPesan.push({ infoPesan, isHistory });
     if (!sedangMemprosesAntrean) jalankanPekerjaAntrean();
 }
-
 async function jalankanPekerjaAntrean() {
     sedangMemprosesAntrean = true;
     while (antreanPesan.length > 0) {
         const { infoPesan, isHistory } = antreanPesan[0];
         await eksekusiKirimKeTelegram(infoPesan, isHistory);
         antreanPesan.shift();
-
         if (antreanPesan.length % 10 === 0) perbaruiStatusTelegram(statusHpSaatIni);
         await delay(isHistory ? 2000 : 500);
-        if (global.gc && antreanPesan.length % 20 === 0) global.gc();
     }
     sedangMemprosesAntrean = false;
     perbaruiStatusTelegram(statusHpSaatIni);
 }
-
 async function pastikanTopik(idPengirim) {
     let threadId = topikDatabase[idPengirim];
     if (threadId) return threadId;
-
     const isGrup = idPengirim.endsWith('@g.us');
     const namaFolder = isGrup ? `👥 GRUP: ${idPengirim.split('@')[0]}` : `👤 Kontak (${idPengirim.split('@')[0]})`;
-
     try {
         const result = await tgBot.createForumTopic(TG_GROUP_ID, namaFolder);
         threadId = result.message_thread_id;
@@ -286,29 +198,20 @@ async function pastikanTopik(idPengirim) {
         return threadId;
     } catch (e) { return null; }
 }
-
 async function eksekusiKirimKeTelegram(infoPesan, isHistory) {
     const idPengirim = infoPesan.key.remoteJid;
     const tipePesan = Object.keys(infoPesan.message)[0];
     const teksKonten = infoPesan.message.conversation || infoPesan.message.extendedTextMessage?.text || '';
-
     cacheAntiDelete.set(infoPesan.key.id, { teks: teksKonten, tipe: tipePesan });
-
     const threadId = await pastikanTopik(idPengirim);
     if (!threadId) return;
-
     const pesanMedia = infoPesan.message.imageMessage || infoPesan.message.videoMessage || infoPesan.message.audioMessage || infoPesan.message.documentMessage;
     const awalan = isHistory ? '🕰️ [Riwayat] ' : '💬 ';
-
     try {
         if (pesanMedia) {
-            const ukuranBytes = parseInt(pesanMedia.fileLength || 0);
-            if (ukuranBytes > MAX_FILE_SIZE_MB * 1024 * 1024) return;
-            
             const streamMedia = await downloadContentFromMessage(pesanMedia, tipePesan.replace('Message', ''));
             let bufferMedia = Buffer.alloc(0);
             for await (const chunk of streamMedia) bufferMedia = Buffer.concat([bufferMedia, chunk]);
-
             await tgBot.sendDocument(TG_GROUP_ID, bufferMedia, { message_thread_id: threadId, caption: isHistory ? '🕰️ Media lama' : '📂 Media' }, { filename: `media_${infoPesan.key.id}` });
         } else if (teksKonten.trim() !== '') {
             await tgBot.sendMessage(TG_GROUP_ID, `${awalan}${teksKonten}`, { message_thread_id: threadId });
@@ -320,17 +223,16 @@ async function eksekusiKirimKeTelegram(infoPesan, isHistory) {
 // MESIN WHATSAPP UTAMA
 // =========================================================================
 async function mulaiBotWhatsApp() {
-    const { state, saveCreds } = await useMongoDBAuthState();
+    const { state, saveCreds, syncToCloud } = await prepareHybridSession();
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
         version,
-        auth: state,
+        auth: state, // Menggunakan Storage HP murni (Sangat cepat)
         printQRInTerminal: false,
         logger: pino({ level: 'silent' }),
-        browser: ['Ubuntu', 'Chrome', '120.0.6099.109'],
+        browser: Browsers.macOS('Desktop'), // Menyamar sebagai Mac resmi
         connectTimeoutMs: 60000,
-        keepAliveIntervalMs: 20000,
         emitOwnEvents: true,
         markOnlineOnConnect: true,
         syncFullHistory: false 
@@ -348,37 +250,7 @@ async function mulaiBotWhatsApp() {
         };
     }
 
-    let bufferRiwayat = [];
-    sock.ev.on('messaging-history.set', async ({ messages }) => {
-        if (!messages || messages.length === 0) return;
-        bufferRiwayat.push(...messages.filter((m) => m.message && !m.key.fromMe));
-    });
-
-    setTimeout(function jadwalSinkronRiwayat() {
-        (async () => {
-            if (bufferRiwayat.length === 0) { setTimeout(jadwalSinkronRiwayat, 60000); return; }
-            sedangSinkronisasi = true;
-            perbaruiStatusTelegram(statusHpSaatIni, true);
-
-            const perKontak = {};
-            for (const msg of bufferRiwayat) {
-                const jid = msg.key.remoteJid;
-                if (!perKontak[jid]) perKontak[jid] = [];
-                if (perKontak[jid].length < HISTORY_BATCH_SIZE) perKontak[jid].push(msg);
-            }
-            bufferRiwayat = [];
-
-            for (const jid of Object.keys(perKontak)) {
-                const pesanTerurut = perKontak[jid].sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
-                for (const msg of pesanTerurut) masukAntrean(msg, true);
-                await delay(3000); 
-            }
-
-            sedangSinkronisasi = false;
-            perbaruiStatusTelegram(statusHpSaatIni, true);
-            setTimeout(jadwalSinkronRiwayat, 60 * 60 * 1000); 
-        })();
-    }, HISTORY_SYNC_DELAY_MS);
+    sock.ev.on('creds.update', saveCreds);
 
     async function mintaKodePairing(retryCount = 0) {
         try {
@@ -393,7 +265,7 @@ async function mulaiBotWhatsApp() {
             console.log(`🔑 KODE PAIRING ANDA: ${kodePairing}`);
             console.log(`==============================================\n`);
 
-            await tgBot.sendMessage(TG_GROUP_ID, `⚠️ *KODE PAIRING:* \`${kodePairing}\`\nNomor: ${cleanNumber}\n\nMasukkan kode ini di HP Anda.`, { parse_mode: 'Markdown' });
+            await tgBot.sendMessage(TG_GROUP_ID, `⚠️ *KODE PAIRING:* \`${kodePairing}\`\nMasukkan kode ini di HP Anda.`, { parse_mode: 'Markdown' });
         } catch (err) {
             sudahMemintaKode = false; 
             if (retryCount < 3) setTimeout(() => mintaKodePairing(retryCount + 1), 5000);
@@ -414,7 +286,10 @@ async function mulaiBotWhatsApp() {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             
             if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-                try { await authCollection.deleteMany({}); } catch (e) {}
+                try { 
+                    await authCollection.deleteMany({}); 
+                    fs.rmSync('session_baileys', { recursive: true, force: true });
+                } catch (e) {}
                 perbaruiStatusTelegram('Logout - perlu pairing ulang', true);
             } else {
                 perbaruiStatusTelegram('Terputus, menyambung ulang...', true);
@@ -423,35 +298,18 @@ async function mulaiBotWhatsApp() {
         } else if (connection === 'open') {
             sedangMenungguPairing = false;
             perbaruiStatusTelegram('Online');
+            console.log('\n✅ BERHASIL TAUTAN! Menyinkronkan ke Cloud agar bisa dijalankan di Render...\n');
+            await syncToCloud(); // Kunci sudah aman di lokal, sekarang kirim ke MongoDB
         }
     });
-
-    sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('messages.upsert', async (chatUpdate) => {
         const infoPesan = chatUpdate.messages[0];
-        if (!infoPesan || !infoPesan.message) return;
-        if (infoPesan.key.fromMe) { waktuTerakhirAktif = Date.now(); return; }
-
+        if (!infoPesan || !infoPesan.message || infoPesan.key.fromMe) return;
         const idPesan = infoPesan.key.id;
         if (cacheAntiSpam.has(idPesan)) return;
         cacheAntiSpam.set(idPesan, true);
-
         masukAntrean(infoPesan, false);
-    });
-
-    sock.ev.on('messages.update', async (updates) => {
-        for (const update of updates) {
-            if (update.update.protocolMessage && update.update.protocolMessage.type === 0) {
-                const idTarget = update.update.protocolMessage.key.id;
-                const dataAsli = cacheAntiDelete.get(idTarget);
-
-                if (dataAsli) {
-                    const threadId = topikDatabase[update.update.protocolMessage.key.remoteJid];
-                    if (threadId) await tgBot.sendMessage(TG_GROUP_ID, `⚠️ [PESAN DIHAPUS]\n👉 Isi: "${dataAsli.teks || 'Media'}"`, { message_thread_id: threadId });
-                }
-            }
-        }
     });
 }
 
@@ -459,19 +317,10 @@ async function mulaiBotWhatsApp() {
 // EXPRESS SERVER & GARBAGE COLLECTOR
 // =========================================================================
 setInterval(() => { if (global.gc) global.gc(); }, 120000);
-
 const app = express();
-app.get('/', (req, res) => res.send('Bot WhatsApp ke Telegram Aktif!'));
-
-process.on('SIGTERM', async () => {
-    if (globalSock) globalSock.end();
-    await mongoClient.close();
-    process.exit(0);
-});
+app.get('/', (req, res) => res.send('Bot Aktif!'));
 
 hubungkanDatabase().then(() => {
     app.listen(process.env.PORT || 3000, '0.0.0.0', () => console.log('Web server berjalan.'));
     mulaiBotWhatsApp();
-}).catch((e) => {
-    process.exit(1);
-});
+}).catch((e) => { process.exit(1); });
