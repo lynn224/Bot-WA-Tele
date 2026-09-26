@@ -1,5 +1,5 @@
 // =========================================================================
-// PENANGKAL CRASH GLOBAL (Wajib di baris paling atas!)
+// PENANGKAL CRASH GLOBAL
 // =========================================================================
 process.on('uncaughtException', (err) => console.log('[ANTI-CRASH] Uncaught Exception:', err.message));
 process.on('unhandledRejection', (reason) => console.log('[ANTI-CRASH] Unhandled Rejection:', reason));
@@ -56,7 +56,7 @@ const antreanPesan = [];
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // =========================================================================
-// MONGODB ADAPTER (Auth State Persisten - NON-BLOCKING & ANTI GAGAL TAUT)
+// MONGODB ADAPTER (SISTEM BULK-WRITE: TAHAN BANTING UNTUK PAIRING)
 // =========================================================================
 const mongoClient = new MongoClient(MONGODB_URI);
 let db, authCollection, configCollection;
@@ -96,6 +96,36 @@ async function useMongoDBAuthState() {
         else creds = initAuthCreds();
     } catch (e) { creds = initAuthCreds(); }
 
+    const memoryBuffer = {}; 
+    let saveTimer = null;
+
+    const eksekusiBulkWrite = async () => {
+        if (Object.keys(memoryBuffer).length === 0) return;
+        
+        const operations = [];
+        for (const key in memoryBuffer) {
+            const value = memoryBuffer[key];
+            if (value === null) {
+                operations.push({ deleteOne: { filter: { _id: key } } });
+            } else {
+                operations.push({
+                    updateOne: {
+                        filter: { _id: key },
+                        update: { $set: { data: JSON.parse(JSON.stringify(value, BufferJSON.replacer)) } },
+                        upsert: true
+                    }
+                });
+            }
+        }
+
+        try {
+            await authCollection.bulkWrite(operations);
+            for (const key in memoryBuffer) delete memoryBuffer[key]; // Kosongkan memori setelah terkirim
+        } catch (e) {
+            console.log('[WARN] Gagal bulkWrite, akan dicoba lagi otomatis...');
+        }
+    };
+
     return {
         state: {
             creds,
@@ -103,40 +133,33 @@ async function useMongoDBAuthState() {
                 get: async (type, ids) => {
                     const data = {};
                     await Promise.all(ids.map(async (id) => {
-                        try {
-                            const rec = await authCollection.findOne({ _id: `${type}-${id}` });
-                            if (rec) data[id] = JSON.parse(JSON.stringify(rec.data), BufferJSON.reviver);
-                        } catch (err) {}
+                        const _id = `${type}-${id}`;
+                        if (memoryBuffer[_id] !== undefined) {
+                            data[id] = memoryBuffer[_id];
+                        } else {
+                            try {
+                                const rec = await authCollection.findOne({ _id });
+                                if (rec) data[id] = JSON.parse(JSON.stringify(rec.data), BufferJSON.reviver);
+                            } catch (err) {}
+                        }
                     }));
                     return data;
                 },
-                // NON-BLOCKING: Fungsi ini dieksekusi di background agar WA tidak timeout saat pairing
                 set: (data) => {
                     for (const category in data) {
                         for (const id in data[category]) {
                             const value = data[category][id];
                             const _id = `${category}-${id}`;
-                            if (value) {
-                                authCollection.updateOne(
-                                    { _id }, 
-                                    { $set: { data: JSON.parse(JSON.stringify(value, BufferJSON.replacer)) } }, 
-                                    { upsert: true }
-                                ).catch(()=>{});
-                            } else {
-                                authCollection.deleteOne({ _id }).catch(()=>{});
-                            }
+                            memoryBuffer[_id] = value || null; 
                         }
                     }
+                    if (saveTimer) clearTimeout(saveTimer);
+                    saveTimer = setTimeout(eksekusiBulkWrite, 2000); // Kirim rombongan setiap 2 detik
                 }
             }
         },
-        // NON-BLOCKING
         saveCreds: () => {
-            authCollection.updateOne(
-                { _id: 'creds' }, 
-                { $set: { data: JSON.parse(JSON.stringify(creds, BufferJSON.replacer)) } }, 
-                { upsert: true }
-            ).catch(()=>{});
+            authCollection.updateOne({ _id: 'creds' }, { $set: { data: JSON.parse(JSON.stringify(creds, BufferJSON.replacer)) } }, { upsert: true }).catch(()=>{});
         }
     };
 }
@@ -170,13 +193,13 @@ tgBot.on('message', async (msg) => {
     const threadId = msg.message_thread_id;
 
     if (teks === '/help') {
-        const help = `🛠️ *MENU COMMAND*\n/status - Diagnostik server\n/siluman [on/off] - Saklar Centang 1\n/kirim [nomor] [pesan] - Kirim WA baru\n/gantiwa [nomor] - Ganti nomor utama\n/restart - Muat ulang mesin`;
+        const help = `🛠️ *MENU COMMAND*\n/status - Diagnostik\n/siluman [on/off] - Centang 1\n/kirim [nomor] [pesan] - Kirim WA\n/gantiwa [nomor] - Ganti nomor\n/restart - Restart`;
         return tgBot.sendMessage(TG_GROUP_ID, help, { message_thread_id: threadId, parse_mode: 'Markdown' });
     }
 
     if (teks === '/status') {
         const ram = (process.memoryUsage().rss / 1024 / 1024).toFixed(2);
-        return tgBot.sendMessage(TG_GROUP_ID, `📊 RAM: ${ram} MB\n🔌 WA: ${globalSock ? 'Terhubung' : 'Terputus'}\n📥 Antrean: ${antreanPesan.length}`, { message_thread_id: threadId });
+        return tgBot.sendMessage(TG_GROUP_ID, `📊 RAM: ${ram} MB\n🔌 WA: ${globalSock ? 'Terhubung' : 'Terputus'}`, { message_thread_id: threadId });
     }
     
     if (teks.startsWith('/siluman ')) {
@@ -203,9 +226,9 @@ tgBot.on('message', async (msg) => {
     if (teks.startsWith('/gantiwa ')) {
         const parts = teks.split(' ');
         const nomorBaru = parts[1].replace(/[^0-9]/g, '');
-        if (!nomorBaru) return tgBot.sendMessage(TG_GROUP_ID, '⚠️ Format: /gantiwa 62812xxxxxxx', { message_thread_id: threadId });
+        if (!nomorBaru) return;
 
-        await tgBot.sendMessage(TG_GROUP_ID, `🔄 *MEMULAI PROSES GANTI NOMOR*\nTarget: ${nomorBaru}`, { message_thread_id: threadId, parse_mode: 'Markdown' });
+        await tgBot.sendMessage(TG_GROUP_ID, `🔄 *PROSES GANTI NOMOR*\nTarget: ${nomorBaru}`, { message_thread_id: threadId, parse_mode: 'Markdown' });
         nomorWaUtama = nomorBaru;
         await simpanKonfigurasiDB();
         if (globalSock) { try { await globalSock.logout(); } catch (e) {} }
@@ -396,7 +419,6 @@ async function mulaiBotWhatsApp() {
             } else {
                 perbaruiStatusTelegram('Terputus, menyambung ulang...', true);
             }
-
             setTimeout(mulaiBotWhatsApp, 5000);
         } else if (connection === 'open') {
             sedangMenungguPairing = false;
@@ -442,7 +464,6 @@ const app = express();
 app.get('/', (req, res) => res.send('Bot WhatsApp ke Telegram Aktif!'));
 
 process.on('SIGTERM', async () => {
-    console.log('[SYS] Sinyal shutdown diterima.');
     if (globalSock) globalSock.end();
     await mongoClient.close();
     process.exit(0);
@@ -452,6 +473,5 @@ hubungkanDatabase().then(() => {
     app.listen(process.env.PORT || 3000, '0.0.0.0', () => console.log('Web server berjalan.'));
     mulaiBotWhatsApp();
 }).catch((e) => {
-    console.error('[FATAL] Gagal konek database:', e.message);
     process.exit(1);
 });
