@@ -1,4 +1,4 @@
-const { default: makeWASocket, DisconnectReason, downloadContentFromMessage, initAuthCreds, BufferJSON } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, downloadContentFromMessage, initAuthCreds, BufferJSON, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const pino = require('pino');
@@ -6,7 +6,7 @@ const NodeCache = require('node-cache');
 const { MongoClient } = require('mongodb');
 
 // =========================================================================
-// KONFIGURASI LINGKUNGAN (ENVIRONMENT VARIABLES)
+// KONFIGURASI LINGKUNGAN
 // =========================================================================
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_GROUP_ID = process.env.TG_GROUP_ID;
@@ -16,7 +16,6 @@ let nomorWaUtama = process.env.NOMOR_WA_UTAMA;
 const MAX_FILE_SIZE_MB = 5;
 const tgBot = new TelegramBot(TG_TOKEN, { polling: true }); 
 
-// CACHE & MEMORI PROTECTOR
 const cacheAntiSpam = new NodeCache({ stdTTL: 3600 }); 
 const cacheAntiDelete = new NodeCache({ stdTTL: 86400 }); 
 
@@ -33,7 +32,7 @@ let sedangSinkronisasi = false;
 const antreanPesan = [];
 
 // =========================================================================
-// KONEKSI MONGODB & AUTH ADAPTER
+// MONGODB ADAPTER
 // =========================================================================
 const mongoClient = new MongoClient(MONGODB_URI);
 let db, authCollection, configCollection;
@@ -107,7 +106,7 @@ async function useMongoDBAuthState() {
 }
 
 // =========================================================================
-// COMMAND CENTER TELEGRAM & LIVE STATUS
+// COMMAND CENTER TELEGRAM
 // =========================================================================
 async function perbaruiStatusTelegram(statusBaru) {
     if (statusHpSaatIni === statusBaru && idPesanStatus && antreanPesan.length === 0 && !sedangSinkronisasi) return;
@@ -162,7 +161,7 @@ tgBot.on('message', async (msg) => {
         try {
             await globalSock.sendMessage(noTujuan, { text: isi });
             tgBot.sendMessage(TG_GROUP_ID, `✅ Terkirim!`, { message_thread_id: threadId });
-        } catch (e) { tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal: ${e.message}`, { message_thread_id: threadId }); }
+        } catch (e) {}
     }
 
     if (teks.startsWith('/gantiwa ')) {
@@ -189,7 +188,7 @@ tgBot.on('message', async (msg) => {
 });
 
 // =========================================================================
-// SISTEM ANTREAN TUNGGAL (FIFO QUEUE WORKER)
+// SISTEM ANTREAN TUNGGAL
 // =========================================================================
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -246,22 +245,32 @@ async function eksekusiKirimKeTelegram(infoPesan, isHistory) {
         } else if (teksKonten.trim() !== "") {
             await tgBot.sendMessage(TG_GROUP_ID, `${awalan}${teksKonten}`, { message_thread_id: threadId });
         }
-    } catch (e) { console.log(`[WARN] Gagal teruskan: ${e.message}`); }
+    } catch (e) {}
 }
 
 // =========================================================================
-// MESIN WHATSAPP UTAMA 
+// MESIN WHATSAPP UTAMA (MENGGUNAKAN KONFIGURASI DARI BOT KAS)
 // =========================================================================
 async function mulaiBotWhatsApp() {
     const { state, saveCreds } = await useMongoDBAuthState();
     
+    // 1. Ambil versi terbaru (Persis seperti Bot Kas)
+    const { version } = await fetchLatestBaileysVersion();
+
+    // 2. Terapkan konfigurasi presisi dari Bot Kas
     const sock = makeWASocket({
+        version, 
         auth: state,
-        logger: pino({ level: 'silent' }), 
         printQRInTerminal: false,
-        syncFullHistory: true,
-        browser: ['Mac OS', 'Chrome', '121.0.0.0'] // Browser diperbaiki untuk memancing kode
+        logger: pino({ level: 'silent' }),
+        browser: ['Ubuntu', 'Chrome', '120.0.6099.109'], // Browser ajaib dari Bot Kas
+        connectTimeoutMs: 60000,
+        keepAliveIntervalMs: 20000,
+        emitOwnEvents: true,
+        markOnlineOnConnect: true,
+        syncFullHistory: true // Ini kita biarkan true agar chat lama tetap masuk
     });
+    
     globalSock = sock; 
 
     // BLOK FILTER ACK DINAMIS (CENTANG 1)
@@ -275,14 +284,12 @@ async function mulaiBotWhatsApp() {
         };
     }
 
-    // PENANGANAN RIWAYAT LAMA 
     sock.ev.on('messaging-history.set', async ({ messages }) => { 
         if (!messages || messages.length === 0) return;
         sedangSinkronisasi = true;
         perbaruiStatusTelegram(statusHpSaatIni);
         
         const pesanTerurut = messages.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
-        
         for (const msg of pesanTerurut) {
             if (!msg.message || msg.key.fromMe) continue;
             masukAntrean(msg, true);
@@ -290,30 +297,49 @@ async function mulaiBotWhatsApp() {
         sedangSinkronisasi = false;
     });
 
-    // SISTEM PENGHASIL KODE PAIRING (DURASI 3 DETIK)
+    // 3. SISTEM PENGHASIL KODE (DURASI 3 DETIK + RETRY SEPERTI BOT KAS)
     if (!sock.authState.creds.registered && !sedangMenungguPairing) {
         sedangMenungguPairing = true;
-        
-        setTimeout(async () => {
+        let retryCount = 0;
+
+        const askCode = async () => {
             try {
-                // Pastikan variabel nomor bersih dari simbol
+                if (!globalSock || sock.authState.creds.registered) return;
                 const cleanNumber = nomorWaUtama.replace(/[^0-9]/g, '');
-                const kodePairing = await sock.requestPairingCode(cleanNumber);
+                
+                let kodePairing = await sock.requestPairingCode(cleanNumber);
+                // Menambahkan strip agar lebih mudah dibaca (Persis Bot Kas)
+                kodePairing = kodePairing?.match(/.{1,4}/g)?.join("-") || kodePairing;
                 
                 tgBot.sendMessage(TG_GROUP_ID, `⚠️ **KODE PAIRING BARU:** \`${kodePairing}\`\nNomor: ${cleanNumber}`, { parse_mode: 'Markdown' });
             } catch (err) { 
-                sedangMenungguPairing = false;
-                console.log('Gagal meminta kode:', err.message);
-                tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal mengambil kode: ${err.message}`);
+                if (retryCount < 3) {
+                    retryCount++;
+                    setTimeout(askCode, 3000); // Coba lagi setiap 3 detik jika gagal
+                } else {
+                    sedangMenungguPairing = false;
+                    tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal mengambil kode setelah 3 kali percobaan.\nAlasan: ${err.message}`);
+                }
             }
-        }, 3000); // DURASI DIKEMBALIKAN KE 3 DETIK
+        };
+
+        // Pemanggilan pertama setelah 3 detik
+        setTimeout(askCode, 3000); 
     }
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
         if (connection === 'close') {
             globalSock = null; 
-            if ((lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut) mulaiBotWhatsApp();
+            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+            const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401;
+            
+            if (isLoggedOut) {
+                try { await authCollection.deleteMany({}); } catch (e) {}
+            }
+            
+            setTimeout(mulaiBotWhatsApp, 5000); // Reconnect otomatis seperti bot kas
+            
         } else if (connection === 'open') {
             sedangMenungguPairing = false; 
             await sock.sendPresenceUpdate('unavailable');
@@ -323,7 +349,6 @@ async function mulaiBotWhatsApp() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // PENANGANAN PESAN BARU
     sock.ev.on('messages.upsert', async (chatUpdate) => {
         const infoPesan = chatUpdate.messages[0];
         if (!infoPesan || !infoPesan.message) return;
@@ -341,7 +366,6 @@ async function mulaiBotWhatsApp() {
         masukAntrean(infoPesan, false);
     });
 
-    // SISTEM PENDETEKSI HAPUS PESAN & LIVE STATUS
     sock.ev.on('messages.update', async (updates) => {
         for (const update of updates) {
             if (update.update.protocolMessage && update.update.protocolMessage.type === 0) {
@@ -371,7 +395,7 @@ setInterval(() => {
 }, 120000);
 
 const app = express();
-app.get('/', (req, res) => res.send('Bot Aktif.'));
+app.get('/', (req, res) => res.send('Bot WhatsApp ke Telegram Aktif!'));
 
 process.on('SIGTERM', async () => {
     console.log('[SYS] Sinyal Shutdown Diterima.');
