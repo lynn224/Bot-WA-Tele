@@ -129,7 +129,7 @@ async function getTopicId(jid, pushName) {
     const isGroup = jid.endsWith('@g.us');
     const nomor = jid.split('@')[0];
     
-    let name = isGroup ? `👥 GRUP: ${nomor}` : `👤 ${pushName \vert{}\vert{} 'Kontak'} (${nomor})`;
+let name = isGroup ? `👥 GRUP: ${nomor}` : `👤 ${pushName || 'Kontak'} (${nomor})`;
     name = name.substring(0, 127); 
     
     const t = await safeTG(() => tgBot.createForumTopic(TG_GROUP_ID, name));
