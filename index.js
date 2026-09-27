@@ -1,6 +1,5 @@
 // =========================================================================
 // INDEX.JS - BOT WA-TELEGRAM STEALTH BRIDGE (VERSI REVISI FINAL)
-// Fitur Baru: Pairing via Telegram (/login), Fallback Topik, Fix Bug 1970
 // =========================================================================
 
 process.on('uncaughtException', (err) => console.error('[ANTI-CRASH] Error:', err.message));
@@ -45,7 +44,7 @@ let dbConfig = {
     sysTopics: {}, 
     statusMaster: {} 
 };
-let lastDeviceActivity = Date.now(); // [BUG FIX] Mencegah 1/1/1970
+let lastDeviceActivity = Date.now();
 let deviceStatusMsgId = null;
 
 const delay = (ms) => new Promise(res => setTimeout(res, ms));
@@ -67,7 +66,7 @@ async function siapkanDatabase() {
 
     const config = await configCollection.findOne({ _id: 'global_settings' });
     if (config && config.data) {
-        dbConfig = { ...dbConfig, ...config.data }; // [BUG FIX] Merge aman
+        dbConfig = { ...dbConfig, ...config.data };
     }
 
     const sessionDir = 'session_baileys';
@@ -95,7 +94,7 @@ async function safeTG(apiCall) {
                 const wait = parseInt(e.message.match(/retry after (\d+)/)?.[1] || 30);
                 await delay((wait + 1) * 1000);
             } else {
-                console.error('[TG ERROR]', e.message); // [BUG FIX] Pantau error Telegram
+                console.error('[TG ERROR]', e.message);
                 return null;
             }
         }
@@ -126,9 +125,10 @@ async function getTopicId(jid, pushName) {
     
     const isGroup = jid.endsWith('@g.us');
     const nomor = jid.split('@')[0];
+    
+    // Perbaikan operator logika OR yang menyebabkan SyntaxError
     let name = isGroup ? `👥 GRUP: ${nomor}` : `👤 ${pushName \vert{}\vert{} 'Kontak'} (${nomor})`;
     
-    // [BUG FIX] Telegram menolak nama topik > 128 karakter
     name = name.substring(0, 127); 
     
     const t = await safeTG(() => tgBot.createForumTopic(TG_GROUP_ID, name));
@@ -153,7 +153,6 @@ tgBot.on('message', async (msg) => {
 
     // COMMANDS SYSTEM
     if (teks.startsWith('/')) {
-        // [FITUR BARU] Login Pairing Code dari Telegram
         if (cmd === '/login') {
             if (!args[1]) return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `⚠️ Format salah. Ketik:\n\`/login 628123456789\``, { parse_mode: 'Markdown' }));
             const nomor = args[1].replace(/[^0-9]/g, '');
@@ -162,7 +161,7 @@ tgBot.on('message', async (msg) => {
                 try {
                     let code = await globalSock.requestPairingCode(nomor);
                     code = code?.match(/.{1,4}/g)?.join("-") || code;
-                    return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🔑 **KODE PAIRING WA ANDA:**\n\n# \`${code}\`\n\nBuka WhatsApp > Perangkat Tertaut > Tautkan dengan Nomor Telepon, lalu masukkan kode di atas.`, { parse_mode: 'Markdown' }));
+                    return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🔑 **KODE PAIRING WA ANDA:**\n\n# \`${code}\`\n\nBuka WhatsApp > Perangkat Tertaut > Tautkan dengan Nomor Telepon.`, { parse_mode: 'Markdown' }));
                 } catch (e) {
                     return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal meminta kode. Pastikan nomor format internasional (contoh: 628...).`));
                 }
@@ -297,7 +296,6 @@ async function mulaiBotWhatsApp() {
             console.log('✅ WA TERHUBUNG');
             sock.sendPresenceUpdate('unavailable');
             
-            // [BUG FIX] Beritahu ke Tele jika konek tapi belum login
             if (!sock.authState.creds.registered) {
                 safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `⚠️ **Bot WA Tersambung tetapi BELUM LOGIN.**\nKetik \`/login 628xxx\` untuk menautkan perangkat.`));
             }
@@ -327,7 +325,7 @@ async function mulaiBotWhatsApp() {
         if (isFromMe) {
             updateDashboardPerangkat(true);
             const tId = await getTopicId(jid, pushName);
-            const tgOpts = tId ? { message_thread_id: tId } : {}; // [BUG FIX] Fallback jika tId gagal
+            const tgOpts = tId ? { message_thread_id: tId } : {}; 
             
             const tgMsg = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📱 *(Dari HP Utama):* ${msg.message.conversation || msg.message.extendedTextMessage?.text || '[Media]'}`, tgOpts));
             
@@ -371,7 +369,7 @@ async function mulaiBotWhatsApp() {
 
         // D. Teks Normal & Media
         const tId = await getTopicId(jid, pushName);
-        const tgOpts = tId ? { message_thread_id: tId } : {}; // [BUG FIX] Kirim ke General jika pembuatan topik ditolak Telegram
+        const tgOpts = tId ? { message_thread_id: tId } : {}; 
         
         const teks = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
         const hasMedia = Object.keys(msg.message).some(k => k.endsWith('Message') && k !== 'extendedTextMessage');
