@@ -127,7 +127,7 @@ async function getTopicId(jid, pushName) {
     const nomor = jid.split('@')[0];
     
     // Perbaikan operator logika OR yang menyebabkan SyntaxError
-    let name = isGroup ? `👥 GRUP: ${nomor}` : `👤 ${pushName \vert{}\vert{} 'Kontak'} (${nomor})`;
+let name = isGroup ? `👥 GRUP: ${nomor}` : `👤 ${pushName || 'Kontak'} (${nomor})`;
     
     name = name.substring(0, 127); 
     
