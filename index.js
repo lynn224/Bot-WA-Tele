@@ -1,5 +1,6 @@
 // =========================================================================
 // INDEX.JS - BOT WA-TELEGRAM STEALTH BRIDGE (RENDER.COM + MONGODB)
+// Fitur: Anti-Crash, Stealth Mode, Audit Log, Status Perangkat
 // =========================================================================
 
 process.on('uncaughtException', (err) => console.log('[ANTI-CRASH] Error:', err.message));
@@ -11,24 +12,24 @@ const {
     downloadContentFromMessage,
     proto,
     fetchLatestBaileysVersion,
-    Browsers
+    Browsers,
+    useMultiFileAuthState
 } = require('@whiskeysockets/baileys');
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const pino = require('pino');
 const { MongoClient } = require('mongodb');
 const fs = require('fs');
-const os = require('os');
 
 // =========================================================================
-// 1. KONFIGURASI ENV
+// 1. KONFIGURASI ENV & VARIABEL GLOBAL
 // =========================================================================
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_GROUP_ID = process.env.TG_GROUP_ID;
 const MONGODB_URI = process.env.MONGODB_URI;
 
 if (!TG_TOKEN || !TG_GROUP_ID || !MONGODB_URI) {
-    console.error('[FATAL] Variabel ENV belum lengkap!');
+    console.error('[FATAL] Variabel ENV (TG_TOKEN, TG_GROUP_ID, MONGODB_URI) belum lengkap!');
     process.exit(1);
 }
 
@@ -44,7 +45,7 @@ let dbConfig = {
     sysTopics: {}, 
     statusMaster: {} 
 };
-let lastDeviceActivity = 0; // Timestamp aktivitas perangkat utama
+let lastDeviceActivity = 0; 
 let deviceStatusMsgId = null;
 
 const delay = (ms) => new Promise(res => setTimeout(res, ms));
@@ -60,19 +61,22 @@ async function siapkanDatabase() {
     db = mongoClient.db('wa_stealth_db');
     authCollection = db.collection('auth_sessions');
     configCollection = db.collection('bot_config');
-    messageMap = db.collection('message_map'); // Untuk pelacakan Edit/Tarik
+    messageMap = db.collection('message_map'); 
+    
     console.log('[DB] Terhubung ke MongoDB Atlas.');
 
     const config = await configCollection.findOne({ _id: 'global_settings' });
     if (config) Object.assign(dbConfig, config.data);
 
-    // Siapkan Folder Auth
+    // Siapkan Folder Auth Baileys
     const sessionDir = 'session_baileys';
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
     const dbDocs = await authCollection.find({}).toArray();
-    for (const doc of dbDocs) fs.writeFileSync(`${sessionDir}/${doc._id}.json`, JSON.stringify(doc.data));
+    for (const doc of dbDocs) {
+        fs.writeFileSync(`${sessionDir}/${doc._id}.json`, JSON.stringify(doc.data));
+    }
 
-    // Siapkan Topik Sistem di Telegram jika belum ada
+    // Siapkan Topik Sistem di Telegram
     await inisialisasiTopikSistem();
 }
 
@@ -111,7 +115,7 @@ async function inisialisasiTopikSistem() {
         }
     }
     await simpanConfigDB();
-    updateDashboardPerangkat(false); // Inisialisasi Dasbor
+    updateDashboardPerangkat(false); 
 }
 
 async function getTopicId(jid, pushName) {
@@ -137,7 +141,7 @@ tgBot.on('message', async (msg) => {
     const threadId = msg.message_thread_id;
     const targetJid = Object.keys(dbConfig.topik).find(k => dbConfig.topik[k] === threadId);
 
-    // COMMANDS
+    // COMMANDS SYSTEM
     if (teks.startsWith('/')) {
         const cmd = teks.split(' ')[0].toLowerCase();
         if (cmd === '/stealth') {
@@ -150,6 +154,9 @@ tgBot.on('message', async (msg) => {
             const ram = Math.round(process.memoryUsage().rss / 1024 / 1024);
             const txt = `📊 **SYSTEM STATUS**\n⏱ Uptime: ${uptime} Menit\n💾 RAM: ${ram} MB\n🔗 WA: ${globalSock ? 'Connected' : 'Disconnected'}\n🛡️ Stealth: ${dbConfig.stealthMode ? 'ON' : 'OFF'}`;
             return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, txt, { message_thread_id: threadId }));
+        }
+        if (cmd === '/cek_online') {
+            return updateDashboardPerangkat(false, true);
         }
         if (cmd === '/mute' && targetJid) {
             if (!dbConfig.muted.includes(targetJid)) dbConfig.muted.push(targetJid);
@@ -164,12 +171,15 @@ tgBot.on('message', async (msg) => {
         if (cmd === '/info' && targetJid) {
             return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `ℹ️ **INFO KONTAK**\nJID: ${targetJid}`, { message_thread_id: threadId }));
         }
+        if (cmd === '/restart') {
+            process.exit(1);
+        }
     }
 
-    // Balas ke WA (Reply atau Pesan Baru)
+    // BALAS KE WA (Jika mengetik di dalam topik)
     if (targetJid && globalSock && !teks.startsWith('/')) {
         await globalSock.sendPresenceUpdate('composing', targetJid);
-        await delay(2000); // Fake Typing
+        await delay(2000); 
         await globalSock.sendPresenceUpdate('paused', targetJid);
         await globalSock.sendMessage(targetJid, { text: teks });
     }
@@ -182,20 +192,24 @@ tgBot.on('message_reaction', async (reaction) => {
         const targetJid = Object.keys(dbConfig.topik).find(k => dbConfig.topik[k] === threadId);
         if (targetJid && globalSock) {
             await globalSock.sendPresenceUpdate('available', targetJid);
-            await globalSock.readMessages([/* Membutuhkan MessageKey, logic disederhanakan */]);
-            safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `✅ Centang biru dikirim untuk obrolan ini.`, { message_thread_id: threadId }));
+            safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `✅ Centang biru dipaksa untuk obrolan ini.`, { message_thread_id: threadId }));
         }
     }
 });
 
 // Dasbor Status Perangkat
-async function updateDashboardPerangkat(isActive) {
+async function updateDashboardPerangkat(isActive, forceReply = false) {
     if (isActive) lastDeviceActivity = Date.now();
     const isOnline = (Date.now() - lastDeviceActivity) < 15 * 60 * 1000;
     
     const txt = `📡 **STATUS PERANGKAT UTAMA**\n\n${isOnline ? '🟢 **ONLINE / AKTIF**' : '🔴 **OFFLINE / IDLE**'}\n🕒 Terakhir Terdeteksi: ${new Date(lastDeviceActivity).toLocaleString('id-ID')} WIB`;
     
     const tId = dbConfig.sysTopics.statusPerangkat;
+    
+    if (forceReply) {
+        return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, txt, { message_thread_id: tId }));
+    }
+
     if (deviceStatusMsgId) {
         await safeTG(() => tgBot.editMessageText(txt, { chat_id: TG_GROUP_ID, message_id: deviceStatusMsgId }));
     } else {
@@ -206,13 +220,12 @@ async function updateDashboardPerangkat(isActive) {
         }
     }
 }
-setInterval(() => updateDashboardPerangkat(false), 60000); // Cek status tiap menit
+setInterval(() => updateDashboardPerangkat(false), 60000); 
 
 // =========================================================================
 // 4. MESIN WHATSAPP & EVENT HANDLER
 // =========================================================================
 async function mulaiBotWhatsApp() {
-    const { useMultiFileAuthState } = require('@whiskeysockets/baileys');
     const { state, saveCreds } = await useMultiFileAuthState('session_baileys');
     const { version } = await fetchLatestBaileysVersion();
 
@@ -228,7 +241,7 @@ async function mulaiBotWhatsApp() {
 
     globalSock = sock;
 
-    // STEALTH MODE: Intersepsi Receipt
+    // STEALTH MODE: Blokir Sinyal Centang Biru & Terkirim
     const orgSendNode = sock.sendNode;
     sock.sendNode = function (node) {
         if (dbConfig.stealthMode && node.tag === 'receipt' && (node.attrs?.type === 'delivery' || node.attrs?.type === 'read')) {
@@ -265,12 +278,12 @@ async function mulaiBotWhatsApp() {
     // Panggilan Masuk -> Audit Log
     sock.ev.on('call', async (calls) => {
         for (const call of calls) {
-            const txt = `📞 **[PANGGILAN ${call.status === 'offer' ? 'MASUK' : 'BERAKHIR'}]**\n👤 Dari: ${call.from}\n🕒 Waktu: ${new Date().toLocaleString()}`;
+            const txt = `📞 **[PANGGILAN ${call.status === 'offer' ? 'MASUK' : 'BERAKHIR'}]**\n👤 Dari: ${call.from}\n🕒 Waktu: ${new Date().toLocaleString('id-ID')}`;
             await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, txt, { message_thread_id: dbConfig.sysTopics.audit }));
         }
     });
 
-    // Pesan Masuk & Log Aktivitas Utama
+    // Handle Pesan Masuk
     sock.ev.on('messages.upsert', async ({ messages, type }) => {
         if (type !== 'notify') return;
         const msg = messages[0];
@@ -281,38 +294,37 @@ async function mulaiBotWhatsApp() {
         const isFromMe = msg.key.fromMe;
         const msgId = msg.key.id;
 
-        // Deteksi Log Aktivitas & Update Dasbor
+        // A. Pengecekan Aktivitas Perangkat Utama (HP Pribadi Anda)
         if (isFromMe) {
             updateDashboardPerangkat(true);
             const tId = await getTopicId(jid, pushName);
-            const tgMsg = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📱 *(Keluar):* ${msg.message.conversation || 'Media'}`, { message_thread_id: tId }));
+            const tgMsg = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📱 *(Dari HP Utama):* ${msg.message.conversation || msg.message.extendedTextMessage?.text || '[Media]'}`, { message_thread_id: tId }));
             
-            if (tgMsg && (Date.now() - lastDeviceActivity < 10000)) { // Kirim log link jika baru mulai sesi aktif
+            // Log ke Aktivitas dengan Link
+            if (tgMsg && (Date.now() - lastDeviceActivity < 10000)) { 
                 const link = `https://t.me/c/${TG_GROUP_ID.toString().replace('-100', '')}/${tId}/${tgMsg.message_id}`;
                 await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📱 **[PESAN KELUAR]** HP Utama mengirim pesan ke *${pushName}*.\n➡️ [Lihat Pesan](${link})`, { message_thread_id: dbConfig.sysTopics.aktivitas, parse_mode: 'Markdown' }));
             }
             return;
         }
 
-        // Penanganan Pesan Ditarik (Revoke) / Edit
+        // B. Deteksi Pesan Ditarik (Revoke) / Edit
         const isRevoke = msg.message.protocolMessage?.type === proto.Message.ProtocolMessage.Type.REVOKE;
         const isEdit = msg.message.protocolMessage?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT;
 
         if (isRevoke || isEdit) {
             const targetId = msg.message.protocolMessage.key.id;
             const tId = await getTopicId(jid, pushName);
-            const note = isRevoke ? `⚠️ *Pesan Ditarik Pengirim*` : `✏️ *Pesan Diedit*`;
+            const note = isRevoke ? `⚠️ *[Sistem] Pesan Ditarik Pengirim*` : `✏️ *[Sistem] Pesan Diedit*`;
             
-            // Kirim notif ke topik kontak
             await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, note, { message_thread_id: tId }));
-            // Kirim notif ke Audit Log
-            await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🗑️ **[AUDIT LOG]**\n👤 Dari: ${pushName}\nTipe: ${note}\nKey: ${targetId}`, { message_thread_id: dbConfig.sysTopics.audit }));
+            await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🗑️ **[AUDIT LOG]**\n👤 Dari: ${pushName}\nTipe: ${note}\nKey Pesan Asli: ${targetId}`, { message_thread_id: dbConfig.sysTopics.audit }));
             return;
         }
 
-        // Status WA (Story)
+        // C. Status WA (Story)
         if (jid === 'status@broadcast') {
-            const pembuat = msg.key.participant;
+            const pembuat = msg.key.participant.split('@')[0];
             const today = new Date().toDateString();
             const masterKey = `${pembuat}-${today}`;
             
@@ -320,30 +332,32 @@ async function mulaiBotWhatsApp() {
                 const mst = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `👤 **Status: ${pembuat}**\n📅 ${today}`, { message_thread_id: dbConfig.sysTopics.statusWA }));
                 if (mst) dbConfig.statusMaster[masterKey] = mst.message_id;
             }
-            // Logic Extract Text/Media & Reply to Master omitted for brevity (sama dengan chat biasa)
-            return;
+            return; 
         }
 
+        // Cek Mute
         if (dbConfig.muted.includes(jid)) return;
 
-        // Ekstrak Pesan Normal
+        // D. Teks Normal & Media
         const tId = await getTopicId(jid, pushName);
         const teks = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
         const hasMedia = Object.keys(msg.message).some(k => k.endsWith('Message') && k !== 'extendedTextMessage');
 
         if (hasMedia) {
-            const type = Object.keys(msg.message)[0];
+            const msgType = Object.keys(msg.message)[0];
             try {
-                const stream = await downloadContentFromMessage(msg.message[type], type.replace('Message', ''));
+                const stream = await downloadContentFromMessage(msg.message[msgType], msgType.replace('Message', ''));
                 let buffer = Buffer.alloc(0);
                 for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
                 await safeTG(() => tgBot.sendDocument(TG_GROUP_ID, buffer, { caption: teks, message_thread_id: tId }));
-            } catch (e) {}
+            } catch (e) {
+                console.error("Gagal unduh media");
+            }
         } else if (teks) {
             await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `💬 ${teks}`, { message_thread_id: tId }));
         }
         
-        // Simpan Map Pesan untuk keperluan edit/tarik di masa depan
+        // E. Simpan ke database untuk pelacakan jika nanti diedit/ditarik
         await messageMap.updateOne({ _id: msgId }, { $set: { jid, teks } }, { upsert: true });
     });
 }
@@ -354,7 +368,18 @@ async function mulaiBotWhatsApp() {
 const app = express();
 app.get('/', (req, res) => res.send('Stealth Bridge Beroperasi 🚀'));
 
-siapkanDatabase().then(() => {
-    app.listen(process.env.PORT || 3000, '0.0.0.0', () => console.log('🌐 Web server aktif.'));
-    mulaiBotWhatsApp();
+// 1. HIDUPKAN WEB SERVER LEBIH DULU
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🌐 Web server aktif di port ${PORT}. Menunggu database...`);
+    
+    // 2. SETELAH SERVER NYALA, BARU KONEKSIKAN DATABASE
+    siapkanDatabase()
+        .then(() => {
+            console.log('✅ Database MongoDB Siap!');
+            mulaiBotWhatsApp();
+        })
+        .catch((e) => {
+            console.error('❌ Gagal Konek DB:', e.message);
+        });
 });
