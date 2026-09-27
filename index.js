@@ -33,6 +33,9 @@ if (!TG_TOKEN || !TG_GROUP_ID || !MONGODB_URI) {
 }
 
 const tgBot = new TelegramBot(TG_TOKEN, { polling: true });
+// Penawar untuk mengatasi putusnya koneksi latar belakang (Agar bot tidak mati)
+tgBot.on('polling_error', (err) => console.error('[TG POLLING] Gangguan koneksi diabaikan:', err.message));
+
 let globalSock = null;
 let startTime = Date.now();
 
@@ -126,9 +129,7 @@ async function getTopicId(jid, pushName) {
     const isGroup = jid.endsWith('@g.us');
     const nomor = jid.split('@')[0];
     
-    // Perbaikan operator logika OR yang menyebabkan SyntaxError
-let name = isGroup ? `👥 GRUP: ${nomor}` : `👤 ${pushName || 'Kontak'} (${nomor})`;
-    
+    let name = isGroup ? `👥 GRUP: ${nomor}` : `👤 ${pushName \vert{}\vert{} 'Kontak'} (${nomor})`;
     name = name.substring(0, 127); 
     
     const t = await safeTG(() => tgBot.createForumTopic(TG_GROUP_ID, name));
@@ -401,12 +402,15 @@ app.get('/', (req, res) => res.send('Stealth Bridge Beroperasi 🚀'));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🌐 Web server aktif di port ${PORT}. Menunggu database...`);
+    console.log(`🌐 Web server aktif di port ${PORT}. Menunggu jaringan Render stabil...`);
     
-    siapkanDatabase()
-        .then(() => {
-            console.log('✅ Database MongoDB Siap!');
-            mulaiBotWhatsApp();
-        })
-        .catch((e) => console.error('❌ Gagal Konek DB:', e.message));
+    // Memberikan jeda 5 detik agar outbound network Render terhubung sempurna dan mencegah AggregateError
+    setTimeout(() => {
+        siapkanDatabase()
+            .then(() => {
+                console.log('✅ Database MongoDB Siap!');
+                mulaiBotWhatsApp();
+            })
+            .catch((e) => console.error('❌ Gagal Konek DB:', e.message));
+    }, 5000);
 });
