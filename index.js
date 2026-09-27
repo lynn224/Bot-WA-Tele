@@ -1,10 +1,10 @@
 // =========================================================================
-// INDEX.JS - BOT WA-TELEGRAM STEALTH BRIDGE (RENDER.COM + MONGODB)
-// Fitur: Anti-Crash, Stealth Mode, Audit Log, Status Perangkat
+// INDEX.JS - BOT WA-TELEGRAM STEALTH BRIDGE (VERSI REVISI FINAL)
+// Fitur Baru: Pairing via Telegram (/login), Fallback Topik, Fix Bug 1970
 // =========================================================================
 
-process.on('uncaughtException', (err) => console.log('[ANTI-CRASH] Error:', err.message));
-process.on('unhandledRejection', (err) => console.log('[ANTI-CRASH] Rejection:', err));
+process.on('uncaughtException', (err) => console.error('[ANTI-CRASH] Error:', err.message));
+process.on('unhandledRejection', (err) => console.error('[ANTI-CRASH] Rejection:', err));
 
 const {
     default: makeWASocket,
@@ -45,7 +45,7 @@ let dbConfig = {
     sysTopics: {}, 
     statusMaster: {} 
 };
-let lastDeviceActivity = 0; 
+let lastDeviceActivity = Date.now(); // [BUG FIX] Mencegah 1/1/1970
 let deviceStatusMsgId = null;
 
 const delay = (ms) => new Promise(res => setTimeout(res, ms));
@@ -66,9 +66,10 @@ async function siapkanDatabase() {
     console.log('[DB] Terhubung ke MongoDB Atlas.');
 
     const config = await configCollection.findOne({ _id: 'global_settings' });
-    if (config) Object.assign(dbConfig, config.data);
+    if (config && config.data) {
+        dbConfig = { ...dbConfig, ...config.data }; // [BUG FIX] Merge aman
+    }
 
-    // Siapkan Folder Auth Baileys
     const sessionDir = 'session_baileys';
     if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir);
     const dbDocs = await authCollection.find({}).toArray();
@@ -76,7 +77,6 @@ async function siapkanDatabase() {
         fs.writeFileSync(`${sessionDir}/${doc._id}.json`, JSON.stringify(doc.data));
     }
 
-    // Siapkan Topik Sistem di Telegram
     await inisialisasiTopikSistem();
 }
 
@@ -94,7 +94,10 @@ async function safeTG(apiCall) {
             if (e.message.includes('429')) {
                 const wait = parseInt(e.message.match(/retry after (\d+)/)?.[1] || 30);
                 await delay((wait + 1) * 1000);
-            } else return null;
+            } else {
+                console.error('[TG ERROR]', e.message); // [BUG FIX] Pantau error Telegram
+                return null;
+            }
         }
     }
     return null;
@@ -120,9 +123,13 @@ async function inisialisasiTopikSistem() {
 
 async function getTopicId(jid, pushName) {
     if (dbConfig.topik[jid]) return dbConfig.topik[jid];
+    
     const isGroup = jid.endsWith('@g.us');
     const nomor = jid.split('@')[0];
-    const name = isGroup ? `👥 GRUP: ${nomor}` : `👤 ${pushName || 'Kontak'} (${nomor})`;
+    let name = isGroup ? `👥 GRUP: ${nomor}` : `👤 ${pushName \vert{}\vert{} 'Kontak'} (${nomor})`;
+    
+    // [BUG FIX] Telegram menolak nama topik > 128 karakter
+    name = name.substring(0, 127); 
     
     const t = await safeTG(() => tgBot.createForumTopic(TG_GROUP_ID, name));
     if (t) {
@@ -130,7 +137,7 @@ async function getTopicId(jid, pushName) {
         await simpanConfigDB();
         return t.message_thread_id;
     }
-    return null;
+    return null; 
 }
 
 // Menerima Pesan / Command dari Telegram
@@ -140,10 +147,30 @@ tgBot.on('message', async (msg) => {
     const teks = msg.text || '';
     const threadId = msg.message_thread_id;
     const targetJid = Object.keys(dbConfig.topik).find(k => dbConfig.topik[k] === threadId);
+    
+    const args = teks.split(' ');
+    const cmd = args[0].toLowerCase();
 
     // COMMANDS SYSTEM
     if (teks.startsWith('/')) {
-        const cmd = teks.split(' ')[0].toLowerCase();
+        // [FITUR BARU] Login Pairing Code dari Telegram
+        if (cmd === '/login') {
+            if (!args[1]) return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `⚠️ Format salah. Ketik:\n\`/login 628123456789\``, { parse_mode: 'Markdown' }));
+            const nomor = args[1].replace(/[^0-9]/g, '');
+            
+            if (globalSock && !globalSock.authState.creds.registered) {
+                try {
+                    let code = await globalSock.requestPairingCode(nomor);
+                    code = code?.match(/.{1,4}/g)?.join("-") || code;
+                    return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🔑 **KODE PAIRING WA ANDA:**\n\n# \`${code}\`\n\nBuka WhatsApp > Perangkat Tertaut > Tautkan dengan Nomor Telepon, lalu masukkan kode di atas.`, { parse_mode: 'Markdown' }));
+                } catch (e) {
+                    return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal meminta kode. Pastikan nomor format internasional (contoh: 628...).`));
+                }
+            } else {
+                return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `✅ Bot WhatsApp sudah berstatus LOGIN. Tidak perlu pairing ulang.`));
+            }
+        }
+        
         if (cmd === '/stealth') {
             dbConfig.stealthMode = teks.includes('on');
             await simpanConfigDB();
@@ -152,12 +179,11 @@ tgBot.on('message', async (msg) => {
         if (cmd === '/ping' || cmd === '/status') {
             const uptime = Math.floor((Date.now() - startTime) / 60000);
             const ram = Math.round(process.memoryUsage().rss / 1024 / 1024);
-            const txt = `📊 **SYSTEM STATUS**\n⏱ Uptime: ${uptime} Menit\n💾 RAM: ${ram} MB\n🔗 WA: ${globalSock ? 'Connected' : 'Disconnected'}\n🛡️ Stealth: ${dbConfig.stealthMode ? 'ON' : 'OFF'}`;
+            const isRegistered = globalSock?.authState?.creds?.registered ? 'Yes' : 'NO (Gunakan /login)';
+            const txt = `📊 **SYSTEM STATUS**\n⏱ Uptime: ${uptime} Menit\n💾 RAM: ${ram} MB\n🔗 WA Socket: ${globalSock ? 'Connected' : 'Disconnected'}\n🔑 Logged In: ${isRegistered}\n🛡️ Stealth: ${dbConfig.stealthMode ? 'ON' : 'OFF'}`;
             return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, txt, { message_thread_id: threadId }));
         }
-        if (cmd === '/cek_online') {
-            return updateDashboardPerangkat(false, true);
-        }
+        if (cmd === '/cek_online') return updateDashboardPerangkat(false, true);
         if (cmd === '/mute' && targetJid) {
             if (!dbConfig.muted.includes(targetJid)) dbConfig.muted.push(targetJid);
             await simpanConfigDB();
@@ -169,11 +195,9 @@ tgBot.on('message', async (msg) => {
             return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🔊 Mute dicabut.`, { message_thread_id: threadId }));
         }
         if (cmd === '/info' && targetJid) {
-            return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `ℹ️ **INFO KONTAK**\nJID: ${targetJid}`, { message_thread_id: threadId }));
+            return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `ℹ️ **INFO KONTAK**\nJID: \`${targetJid}\``, { message_thread_id: threadId, parse_mode: 'Markdown' }));
         }
-        if (cmd === '/restart') {
-            process.exit(1);
-        }
+        if (cmd === '/restart') process.exit(1);
     }
 
     // BALAS KE WA (Jika mengetik di dalam topik)
@@ -270,8 +294,13 @@ async function mulaiBotWhatsApp() {
             globalSock = null;
             setTimeout(mulaiBotWhatsApp, 5000);
         } else if (update.connection === 'open') {
-            console.log('✅ WA TERHUBUNG (STEALTH AKTIF)');
+            console.log('✅ WA TERHUBUNG');
             sock.sendPresenceUpdate('unavailable');
+            
+            // [BUG FIX] Beritahu ke Tele jika konek tapi belum login
+            if (!sock.authState.creds.registered) {
+                safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `⚠️ **Bot WA Tersambung tetapi BELUM LOGIN.**\nKetik \`/login 628xxx\` untuk menautkan perangkat.`));
+            }
         }
     });
 
@@ -298,10 +327,11 @@ async function mulaiBotWhatsApp() {
         if (isFromMe) {
             updateDashboardPerangkat(true);
             const tId = await getTopicId(jid, pushName);
-            const tgMsg = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📱 *(Dari HP Utama):* ${msg.message.conversation || msg.message.extendedTextMessage?.text || '[Media]'}`, { message_thread_id: tId }));
+            const tgOpts = tId ? { message_thread_id: tId } : {}; // [BUG FIX] Fallback jika tId gagal
             
-            // Log ke Aktivitas dengan Link
-            if (tgMsg && (Date.now() - lastDeviceActivity < 10000)) { 
+            const tgMsg = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📱 *(Dari HP Utama):* ${msg.message.conversation || msg.message.extendedTextMessage?.text || '[Media]'}`, tgOpts));
+            
+            if (tgMsg && (Date.now() - lastDeviceActivity < 10000) && tId) { 
                 const link = `https://t.me/c/${TG_GROUP_ID.toString().replace('-100', '')}/${tId}/${tgMsg.message_id}`;
                 await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📱 **[PESAN KELUAR]** HP Utama mengirim pesan ke *${pushName}*.\n➡️ [Lihat Pesan](${link})`, { message_thread_id: dbConfig.sysTopics.aktivitas, parse_mode: 'Markdown' }));
             }
@@ -315,9 +345,10 @@ async function mulaiBotWhatsApp() {
         if (isRevoke || isEdit) {
             const targetId = msg.message.protocolMessage.key.id;
             const tId = await getTopicId(jid, pushName);
+            const tgOpts = tId ? { message_thread_id: tId } : {};
             const note = isRevoke ? `⚠️ *[Sistem] Pesan Ditarik Pengirim*` : `✏️ *[Sistem] Pesan Diedit*`;
             
-            await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, note, { message_thread_id: tId }));
+            await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, note, tgOpts));
             await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🗑️ **[AUDIT LOG]**\n👤 Dari: ${pushName}\nTipe: ${note}\nKey Pesan Asli: ${targetId}`, { message_thread_id: dbConfig.sysTopics.audit }));
             return;
         }
@@ -340,6 +371,8 @@ async function mulaiBotWhatsApp() {
 
         // D. Teks Normal & Media
         const tId = await getTopicId(jid, pushName);
+        const tgOpts = tId ? { message_thread_id: tId } : {}; // [BUG FIX] Kirim ke General jika pembuatan topik ditolak Telegram
+        
         const teks = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
         const hasMedia = Object.keys(msg.message).some(k => k.endsWith('Message') && k !== 'extendedTextMessage');
 
@@ -349,15 +382,15 @@ async function mulaiBotWhatsApp() {
                 const stream = await downloadContentFromMessage(msg.message[msgType], msgType.replace('Message', ''));
                 let buffer = Buffer.alloc(0);
                 for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
-                await safeTG(() => tgBot.sendDocument(TG_GROUP_ID, buffer, { caption: teks, message_thread_id: tId }));
+                await safeTG(() => tgBot.sendDocument(TG_GROUP_ID, buffer, { caption: teks, ...tgOpts }));
             } catch (e) {
                 console.error("Gagal unduh media");
             }
         } else if (teks) {
-            await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `💬 ${teks}`, { message_thread_id: tId }));
+            await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `💬 ${teks}`, tgOpts));
         }
         
-        // E. Simpan ke database untuk pelacakan jika nanti diedit/ditarik
+        // E. Simpan ke database untuk pelacakan Edit/Tarik
         await messageMap.updateOne({ _id: msgId }, { $set: { jid, teks } }, { upsert: true });
     });
 }
@@ -368,18 +401,14 @@ async function mulaiBotWhatsApp() {
 const app = express();
 app.get('/', (req, res) => res.send('Stealth Bridge Beroperasi 🚀'));
 
-// 1. HIDUPKAN WEB SERVER LEBIH DULU
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🌐 Web server aktif di port ${PORT}. Menunggu database...`);
     
-    // 2. SETELAH SERVER NYALA, BARU KONEKSIKAN DATABASE
     siapkanDatabase()
         .then(() => {
             console.log('✅ Database MongoDB Siap!');
             mulaiBotWhatsApp();
         })
-        .catch((e) => {
-            console.error('❌ Gagal Konek DB:', e.message);
-        });
+        .catch((e) => console.error('❌ Gagal Konek DB:', e.message));
 });
