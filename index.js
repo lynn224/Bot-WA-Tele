@@ -1,5 +1,6 @@
 // =========================================================================
-// INDEX.JS - WA-TELEGRAM STEALTH BRIDGE (ULTIMATE V12 - TERMUX SESSION & CONTACT SYNC MERGE)
+// INDEX.JS - WA-TELEGRAM STEALTH BRIDGE (ULTIMATE V11 - FINAL ARCHITECTURE)
+// Fixes: Direct Inner-Object Media Decryption (View Once), MongoDB Contact Sync
 // =========================================================================
 
 process.on('uncaughtException', (err) => console.error('[ANTI-CRASH] Uncaught Exception:', err.message));
@@ -141,7 +142,7 @@ async function useMongoDBAuthState() {
 }
 
 // =========================================================================
-// PENGAMBIL KONTAK DARI MONGODB (Sinkronisasi Termux)
+// FUNGSI KONSUMSI BUKU KONTAK DARI MONGODB
 // =========================================================================
 function ambilInfoKontak(jid, pushNameFallback) {
     if (!jid) return { nama: 'Unknown', nomor: 'Unknown', isLid: false, isGrup: false };
@@ -226,7 +227,7 @@ tgBot.on('message', async (msg) => {
     if (cmd === '/info') {
         const info = ambilInfoKontak(targetJid, null);
         let ketLid = info.isLid ? '\n_*(Komunitas/Saluran WA Rahasia)*_' : '';
-        return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `ℹ️ **DETAIL KONTAK**\n\n👤 Nama Phonebook: ${info.nama}\n📞 Nomor: \`${info.isLid ? 'LID' : '+' + info.nomor}\`\n💬 Tipe: ${info.isGrup ? 'Grup' : 'Pribadi'}\n🆔 JID: \`${targetJid || 'Belum ada'}\`${ketLid}`, { message_thread_id: threadId, parse_mode: 'Markdown' }));
+        return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `ℹ️ **DETAIL KONTAK**\n\n👤 Nama Asli/Phonebook: ${info.nama}\n📞 Nomor: \`${info.isLid ? 'LID' : '+' + info.nomor}\`\n💬 Tipe: ${info.isGrup ? 'Grup' : 'Pribadi'}\n🆔 JID: \`${targetJid || 'Belum ada'}\`${ketLid}`, { message_thread_id: threadId, parse_mode: 'Markdown' }));
     }
 
     if (cmd === '/stealth') { dbConfig.stealthMode = !dbConfig.stealthMode; await simpanKonfigurasiDB(); perbaruiStatusTelegram(statusHpSaatIni, true); return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🛡️ Stealth Mode: ${dbConfig.stealthMode ? '🟢 ON' : '🔴 OFF'}`, { message_thread_id: threadId })); }
@@ -293,22 +294,24 @@ tgBot.on('message_reaction', async (reaction) => {
 });
 
 // =========================================================================
-// DEEP SCAN UNWRAPPER (VIEW ONCE FIX)
+// DEEP SCAN UNWRAPPER (FIX BRANKAS INTI)
 // =========================================================================
 function bukaBrankasWA(messageObj) {
     if (!messageObj) return { isViewOnce: false, actualMessage: {}, statusJidList: [] };
     let actualMessage = messageObj;
     let isViewOnce = false;
 
+    // Bersihkan pembungkus pertama
     if (actualMessage.documentWithCaptionMessage) actualMessage = actualMessage.documentWithCaptionMessage.message;
     if (actualMessage.ephemeralMessage) actualMessage = actualMessage.ephemeralMessage.message;
     if (actualMessage.ptvMessage) actualMessage = actualMessage.ptvMessage; 
 
+    // Robek kardus View Once V2
     const viewOnceKeys = ['viewOnceMessage', 'viewOnceMessageV2', 'viewOnceMessageV2Extension'];
     let key = Object.keys(actualMessage).find(k => viewOnceKeys.includes(k));
     if (key) {
         isViewOnce = true;
-        actualMessage = actualMessage[key].message; 
+        actualMessage = actualMessage[key].message; // Ini adalah Brankas Inti (imageMessage / videoMessage)
     }
 
     let statusJidList = [];
@@ -345,6 +348,7 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isFromMe) {
     const idPengirim = infoPesan.key.remoteJid;
     if (dbConfig.muted.includes(idPengirim)) return; 
 
+    // Coba tambahkan pushName sbg cadangan sebelum panggil pastikanTopik
     if (!dbConfig.contacts[idPengirim] && pushName && pushName !== 'Kontak') {
         dbConfig.contacts[idPengirim] = pushName; simpanKonfigurasiDB();
     }
@@ -352,6 +356,7 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isFromMe) {
     let threadId = await pastikanTopik(idPengirim, pushName);
     const opts = threadId ? { message_thread_id: threadId } : {}; 
     
+    // PEMBONGKARAN PESAN
     const { isViewOnce, actualMessage } = bukaBrankasWA(infoPesan.message);
     const tipePesan = Object.keys(actualMessage || {}).find(k => k !== 'senderKeyDistributionMessage' && k !== 'messageContextInfo');
     
@@ -415,6 +420,7 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isFromMe) {
                 return;
             }
             
+            // Mengambil Brankas Inti Saja Sesuai Logika
             let tipeMediaUnduh = '';
             let mediaObj = null;
 
@@ -459,42 +465,6 @@ async function mulaiBotWhatsApp() {
         if (dbConfig.stealthMode && node.tag === 'receipt' && (node.attrs?.type === 'delivery' || node.attrs?.type === 'read')) return Promise.resolve(); 
         return orgSendNode.apply(this, arguments);
     };
-
-    // PENDENGAR KONTAK (UPSERT & UPDATE) DARI SESI TERMUX
-    sock.ev.on('contacts.upsert', (contacts) => {
-        let updated = false;
-        for (const contact of contacts) {
-            if (contact.name || contact.notify) { 
-                dbConfig.contacts[contact.id] = contact.name || contact.notify; 
-                updated = true; 
-            }
-        } 
-        if (updated) simpanKonfigurasiDB();
-    });
-    
-    sock.ev.on('contacts.update', (contacts) => {
-        let updated = false;
-        for (const contact of contacts) {
-            if (contact.name || contact.notify) { 
-                dbConfig.contacts[contact.id] = contact.name || contact.notify; 
-                updated = true; 
-            }
-        } 
-        if (updated) simpanKonfigurasiDB();
-    });
-
-    sock.ev.on('messaging-history.set', ({ contacts }) => {
-        if (contacts) {
-            let updated = false;
-            for (const c of contacts) {
-                if (c.id && (c.name || c.notify)) {
-                    dbConfig.contacts[c.id] = c.name || c.notify;
-                    updated = true;
-                }
-            } 
-            if (updated) simpanKonfigurasiDB();
-        }
-    });
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect } = update;
