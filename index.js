@@ -1,5 +1,5 @@
 // =========================================================================
-// INDEX.JS - WA-TELEGRAM STEALTH BRIDGE (ULTIMATE V13 - ANTI-LOOP STABLE)
+// INDEX.JS - WA-TELEGRAM STEALTH BRIDGE (ULTIMATE V14 - STABLE VERSION FIX)
 // =========================================================================
 
 process.on('uncaughtException', (err) => console.error('[ANTI-CRASH] Uncaught Exception:', err.message));
@@ -11,7 +11,6 @@ const {
     downloadContentFromMessage,
     initAuthCreds,
     BufferJSON,
-    fetchLatestBaileysVersion,
     Browsers
 } = require('@whiskeysockets/baileys');
 const TelegramBot = require('node-telegram-bot-api');
@@ -85,7 +84,7 @@ async function safeTG(apiCall) {
     } return null;
 }
 
-const mongoClient = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 10000 });
+const mongoClient = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 15000 });
 let db, authCollection, configCollection;
 
 async function hubungkanDatabase() {
@@ -451,7 +450,9 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isFromMe) {
 async function mulaiBotWhatsApp() {
     try {
         const { state, saveCreds } = await useMongoDBAuthState();
-        const { version } = await fetchLatestBaileysVersion();
+        
+        // Versi Baileys Statis (Tanpa Fetch HTTP eksternal yang rawan timeout di Render)
+        const version = [2, 3000, 1015901307];
 
         const sock = makeWASocket({
             version, auth: state, printQRInTerminal: false, logger: pino({ level: 'silent' }),
@@ -693,7 +694,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🌐 Web server aktif di port ${PORT}.`);
     
-    // Jalankan database dan bot secara asinkron tanpa mematikan server jika gagal
     hubungkanDatabase()
         .then(() => {
             mulaiBotWhatsApp();
