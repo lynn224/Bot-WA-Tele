@@ -1,9 +1,4 @@
-// =========================================================================
-// INDEX.JS - WA-TELEGRAM STEALTH BRIDGE (ULTIMATE V10 - CRASH FIX)
-// Fixes: Removed makeInMemoryStore (Error 500), Fixed Telegram 409 Conflict
-// =========================================================================
-
-process.on('uncaughtException', (err) => console.error('[ANTI-CRASH] Uncaught Exception:', err.message));
+process.on('uncaughtException', (err) => console.error('[ANTI-CRASH] Uncaught Exception:', err.message, err.stack));
 process.on('unhandledRejection', (err) => console.error('[ANTI-CRASH] Unhandled Rejection:', err));
 
 const {
@@ -21,99 +16,115 @@ const pino = require('pino');
 const NodeCache = require('node-cache');
 const { MongoClient } = require('mongodb');
 
+// =========================================================================
+// KONFIGURASI LINGKUNGAN
+// =========================================================================
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_GROUP_ID = process.env.TG_GROUP_ID;
 const MONGODB_URI = process.env.MONGODB_URI;
 
 if (!TG_TOKEN || !TG_GROUP_ID || !MONGODB_URI) {
-    console.error('[FATAL] Variabel ENV belum lengkap di Render.');
+    console.error('[FATAL] Pastikan TG_TOKEN, TG_GROUP_ID, MONGODB_URI sudah diset di Environment Variables.');
     process.exit(1);
 }
 
+const HISTORY_SYNC_DELAY_MS = 15 * 60 * 1000;
+const HISTORY_BATCH_SIZE = 40;
+
 const tgBot = new TelegramBot(TG_TOKEN, { polling: true });
-tgBot.on('polling_error', (err) => console.error('[TG POLLING] Gangguan:', err.message));
+tgBot.on('polling_error', (err) => console.error('[TG POLLING]', err.message));
 
 tgBot.setMyCommands([
-    { command: 'status', description: 'Cek RAM & Koneksi' },
-    { command: 'setmedia', description: 'Atur batas maksimal unduh media (MB)' },
-    { command: 'stealth', description: 'Nyalakan/Matikan Centang 1' },
-    { command: 'info', description: 'Detail Kontak Topik ini' },
-    { command: 'mute', description: 'Bisukan Topik' },
-    { command: 'unmute', description: 'Bunyikan Topik' },
-    { command: 'login', description: 'Tautkan nomor WA baru' },
+    { command: 'help', description: 'Daftar perintah' },
+    { command: 'status', description: 'Cek RAM & koneksi' },
+    { command: 'setmedia', description: 'Atur batas ukuran media (MB)' },
+    { command: 'info', description: 'Detail kontak topik ini' },
+    { command: 'mute', description: 'Bisukan topik ini' },
+    { command: 'unmute', description: 'Bunyikan topik ini' },
+    { command: 'login', description: 'Tautkan/ganti nomor WA' },
     { command: 'restart', description: 'Restart server bot' }
 ]);
 
 const cacheAntiSpam = new NodeCache({ stdTTL: 3600 });
 const cacheAntiDelete = new NodeCache({ stdTTL: 86400 });
-const msgMapCache = new NodeCache({ stdTTL: 86400 }); 
-const statusMemory = new NodeCache({ stdTTL: 86400 }); 
-const botSentCache = new NodeCache({ stdTTL: 3600 }); 
+const statusMemory = new NodeCache({ stdTTL: 86400 });
+const msgMapCache = new NodeCache({ stdTTL: 86400 });
 
 let globalSock = null;
 let sedangMenungguPairing = false;
 let sudahMemintaKode = false;
 
-let dbConfig = { 
-    topik: {}, sysTopics: {}, muted: [], stealthMode: true, 
-    nomorWaUtama: process.env.NOMOR_WA_UTAMA || null, 
-    pinned_status_msg_id: null, maxMediaMB: 20,
-    contacts: {}, topicInfoMsgs: {}
+// Konfigurasi tunggal, dipersist ke MongoDB (skema FLAT - kompatibel dgn dashboard yang sudah dibuat)
+let dbConfig = {
+    topik: {},
+    kontak: {},
+    sysTopics: {},
+    muted: [],
+    nomor_wa_utama: process.env.NOMOR_WA_UTAMA || null,
+    pinned_status_msg_id: null,
+    maxMediaMB: 5,
+    topicInfoMsgs: {}
 };
 
 let statusHpSaatIni = 'Menghubungkan...';
 let sedangMemprosesAntrean = false;
+let sedangSinkronisasi = false;
 const antreanPesan = [];
 const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-async function setTGReaction(msgId, emoji) {
-    try {
-        await fetch('https://api.telegram.org/bot' + TG_TOKEN + '/setMessageReaction', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: TG_GROUP_ID, message_id: msgId, reaction: [{ type: 'emoji', emoji: emoji }] })
-        });
-    } catch (e) {}
-}
-
 async function safeTG(apiCall) {
     for (let i = 0; i < 3; i++) {
-        try { return await apiCall(); } 
-        catch (e) {
+        try {
+            return await apiCall();
+        } catch (e) {
             if (e.message && e.message.includes('429')) {
                 const wait = parseInt(e.message.match(/retry after (\d+)/)?.[1] || '30', 10);
+                console.log(`[TG RATE LIMIT] Menunggu ${wait + 1} detik...`);
                 await delay((wait + 1) * 1000);
-            } else if (e.message && (e.message.includes('entities') || e.message.includes('too long'))) { return null; } 
-            else { return null; }
+            } else {
+                console.error('[TG ERROR]', e.message);
+                return null;
+            }
         }
-    } return null;
+    }
+    return null;
 }
 
-const mongoClient = new MongoClient(MONGODB_URI);
-let db, authCollection, configCollection;
+// =========================================================================
+// MONGODB
+// =========================================================================
+const mongoClient = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 15000 });
+let authCollection, configCollection;
 
 async function hubungkanDatabase() {
     await mongoClient.connect();
-    db = mongoClient.db('wa_backup_db');
+    const db = mongoClient.db('wa_backup_db');
     authCollection = db.collection('auth_sessions');
     configCollection = db.collection('bot_config');
+    console.log('[DB] Terhubung ke MongoDB Atlas.');
 
     const config = await configCollection.findOne({ _id: 'global_settings' });
-    if (config && config.data) {
-        dbConfig = { ...dbConfig, ...config.data };
-        if (!dbConfig.contacts) dbConfig.contacts = {};
-        if (!dbConfig.topicInfoMsgs) dbConfig.topicInfoMsgs = {};
+    if (config) {
+        dbConfig = { ...dbConfig, ...config };
+        delete dbConfig._id;
     }
     await inisialisasiTopikSistem();
 }
 
 async function simpanKonfigurasiDB() {
-    await configCollection.updateOne({ _id: 'global_settings' }, { $set: { data: dbConfig } }, { upsert: true });
+    try {
+        await configCollection.updateOne({ _id: 'global_settings' }, { $set: dbConfig }, { upsert: true });
+    } catch (e) {
+        console.error('[DB SAVE ERROR]', e.message);
+    }
 }
 
 async function useMongoDBAuthState() {
-    let creds; const doc = await authCollection.findOne({ _id: 'creds' });
-    if (doc) creds = JSON.parse(JSON.stringify(doc.data), BufferJSON.reviver); else creds = initAuthCreds();
+    let creds;
+    const doc = await authCollection.findOne({ _id: 'creds' });
+    if (doc) creds = JSON.parse(JSON.stringify(doc.data), BufferJSON.reviver);
+    else creds = initAuthCreds();
+
     return {
         state: {
             creds,
@@ -123,134 +134,211 @@ async function useMongoDBAuthState() {
                     await Promise.all(ids.map(async (id) => {
                         const rec = await authCollection.findOne({ _id: `${type}-${id}` });
                         if (rec) data[id] = JSON.parse(JSON.stringify(rec.data), BufferJSON.reviver);
-                    })); return data;
+                    }));
+                    return data;
                 },
                 set: async (data) => {
                     const tasks = [];
                     for (const category in data) {
                         for (const id in data[category]) {
                             const value = data[category][id];
-                            if (value) tasks.push(authCollection.updateOne({ _id: `${category}-${id}` }, { $set: { data: JSON.parse(JSON.stringify(value, BufferJSON.replacer)) } }, { upsert: true }));
-                            else tasks.push(authCollection.deleteOne({ _id: `${category}-${id}` }));
+                            const _id = `${category}-${id}`;
+                            if (value) tasks.push(authCollection.updateOne({ _id }, { $set: { data: JSON.parse(JSON.stringify(value, BufferJSON.replacer)) } }, { upsert: true }));
+                            else tasks.push(authCollection.deleteOne({ _id }));
                         }
-                    } await Promise.all(tasks);
+                    }
+                    await Promise.all(tasks);
                 }
             }
         },
-        saveCreds: async () => { await authCollection.updateOne({ _id: 'creds' }, { $set: { data: JSON.parse(JSON.stringify(creds, BufferJSON.replacer)) } }, { upsert: true }); }
+        saveCreds: async () => {
+            await authCollection.updateOne({ _id: 'creds' }, { $set: { data: JSON.parse(JSON.stringify(creds, BufferJSON.replacer)) } }, { upsert: true });
+        }
     };
 }
 
 // =========================================================================
-// FUNGSI INTI 1: PHONEBOOK IDENTIFIER MONGODB
+// INFO KONTAK (nama tersimpan HP > pushName > LID/nomor)
 // =========================================================================
 function ambilInfoKontak(jid, pushNameFallback) {
     if (!jid) return { nama: 'Unknown', nomor: 'Unknown', isLid: false, isGrup: false };
     const nomor = jid.split('@')[0];
     const isLid = jid.includes('@lid');
     const isGrup = jid.endsWith('@g.us');
-    
-    // Langsung ambil dari database cache kita yang diisi saat history sync
-    let nama = dbConfig.contacts[jid] || pushNameFallback;
-    
-    if (!nama || nama === 'Kontak') {
-        nama = isGrup ? 'Grup ' + nomor : (isLid ? 'Rahasia (LID)' : '+' + nomor);
-    } else {
-        dbConfig.contacts[jid] = nama; // Simpan jika ada pushName yang nyangkut
+
+    let nama = dbConfig.kontak[jid] || pushNameFallback;
+    if (!nama) {
+        nama = isGrup ? `Grup ${nomor}` : (isLid ? 'Rahasia (LID)' : `+${nomor}`);
+    } else if (!dbConfig.kontak[jid]) {
+        dbConfig.kontak[jid] = nama; // simpan pushName sbg fallback sementara, nanti di-upgrade oleh contacts.upsert
     }
     return { nama, nomor, isLid, isGrup };
 }
 
+// =========================================================================
+// TOPIK TELEGRAM
+// =========================================================================
 async function inisialisasiTopikSistem() {
-    const sysNames = { audit: "🗑️ Audit Log", aktivitas: "📝 Log Aktivitas", statusWA: "📱 Status WA" };
+    const sysNames = { audit: '🗑️ Audit Log', aktivitas: '📝 Log Aktivitas', statusWA: '📱 Status WA' };
     let updated = false;
     for (const [key, name] of Object.entries(sysNames)) {
         if (!dbConfig.sysTopics[key]) {
             const t = await safeTG(() => tgBot.createForumTopic(TG_GROUP_ID, name));
-            if (t) { dbConfig.sysTopics[key] = t.message_thread_id; updated = true; await delay(2000); }
+            if (t) { dbConfig.sysTopics[key] = t.message_thread_id; updated = true; await delay(1500); }
         }
-    } if (updated) await simpanKonfigurasiDB();
+    }
+    if (updated) await simpanKonfigurasiDB();
 }
 
 async function pastikanTopik(jid, pushName) {
+    if (dbConfig.topik[jid]) return dbConfig.topik[jid];
+
     const info = ambilInfoKontak(jid, pushName);
-    if (!dbConfig.topik[jid]) {
-        let namaFolder = info.isGrup ? '👥 GRUP: ' + info.nama : '👤 ' + info.nama + ' (' + info.nomor + ')';
-        namaFolder = namaFolder.substring(0, 127);
-        
-        const result = await safeTG(() => tgBot.createForumTopic(TG_GROUP_ID, namaFolder));
-        if (result) {
-            dbConfig.topik[jid] = result.message_thread_id;
-            let displayNum = info.isLid ? 'Rahasia (LID)' : info.nomor;
-            const infoMsg = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, 'ℹ️ **INFO TOPIK**\nNama: ' + info.nama + '\nNomor: ' + displayNum + '\nStatus: 🔴 Offline', { message_thread_id: result.message_thread_id, parse_mode: 'Markdown' }));
-            if (infoMsg) {
-                dbConfig.topicInfoMsgs[jid] = infoMsg.message_id;
-                await safeTG(() => tgBot.pinChatMessage(TG_GROUP_ID, infoMsg.message_id, { disable_notification: true }));
-            }
-            await simpanKonfigurasiDB();
+    let namaFolder = info.isGrup ? `👥 GRUP: ${info.nama}` : `👤 ${info.nama} (${info.nomor})`;
+    namaFolder = namaFolder.substring(0, 127);
+
+    const result = await safeTG(() => tgBot.createForumTopic(TG_GROUP_ID, namaFolder));
+    if (!result) throw new Error('Gagal membuat topik setelah retry');
+
+    dbConfig.topik[jid] = result.message_thread_id;
+
+    // Pesan info topik yang di-pin, berisi nama/nomor + status online/typing (dari presence.update,
+    // yaitu info yang memang sudah dikirim WA ke akun ini secara protokol normal - bukan hasil manipulasi).
+    if (!info.isGrup) {
+        const displayNum = info.isLid ? 'Rahasia (LID)' : `+${info.nomor}`;
+        const infoMsg = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID,
+            `ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor: ${displayNum}\nStatus: 🔴 Offline`,
+            { message_thread_id: result.message_thread_id, parse_mode: 'Markdown' }));
+        if (infoMsg) {
+            dbConfig.topicInfoMsgs[jid] = infoMsg.message_id;
+            await safeTG(() => tgBot.pinChatMessage(TG_GROUP_ID, infoMsg.message_id, { disable_notification: true }));
         }
     }
+
+    await simpanKonfigurasiDB();
     return dbConfig.topik[jid];
 }
 
-// =========================================================================
-// COMMAND CENTER & TELEGRAM TO WA MEDIA HANDLER (2-Way)
-// =========================================================================
-async function perbaruiStatusTelegram(statusBaru, paksa = false) {
-    if (!paksa && statusHpSaatIni === statusBaru && dbConfig.pinned_status_msg_id && antreanPesan.length === 0) return;
-    statusHpSaatIni = statusBaru;
-    const stealthStatus = dbConfig.stealthMode ? '🟢 AKTIF' : '🔴 MATI';
-    let teksStatus = `🖥️ *COMMAND CENTER*\n\n📱 Koneksi WA: *${statusBaru}*\n🛡️ Stealth Mode: ${stealthStatus}\n📁 Batas Media: ${dbConfig.maxMediaMB} MB\n📦 Antrean: ${antreanPesan.length}`;
-    try {
-        if (dbConfig.pinned_status_msg_id) { await safeTG(() => tgBot.editMessageText(teksStatus, { chat_id: TG_GROUP_ID, message_id: dbConfig.pinned_status_msg_id, parse_mode: 'Markdown' })); } 
-        else {
-            const msg = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, teksStatus, { parse_mode: 'Markdown' }));
-            if (msg) { dbConfig.pinned_status_msg_id = msg.message_id; await simpanKonfigurasiDB(); await safeTG(() => tgBot.pinChatMessage(TG_GROUP_ID, dbConfig.pinned_status_msg_id, { disable_notification: true })); }
-        }
-    } catch (e) { dbConfig.pinned_status_msg_id = null; }
+async function renameTopikJikaPerlu(jid, namaBaru, isGrup) {
+    if (!namaBaru) return;
+    const namaLama = dbConfig.kontak[jid];
+    dbConfig.kontak[jid] = namaBaru;
+    if (namaLama === namaBaru) return;
+    await simpanKonfigurasiDB();
+
+    const threadId = dbConfig.topik[jid];
+    if (!threadId) return;
+
+    const namaTopikBaru = isGrup ? `👥 GRUP: ${namaBaru}` : `👤 ${namaBaru} (${jid.split('@')[0]})`;
+    await safeTG(() => tgBot.editForumTopic(TG_GROUP_ID, threadId, { name: namaTopikBaru.substring(0, 127) }));
 }
 
+// =========================================================================
+// STATUS COMMAND CENTER (TANPA toggle stealth)
+// =========================================================================
+async function perbaruiStatusTelegram(statusBaru, paksa = false) {
+    if (!paksa && statusHpSaatIni === statusBaru && dbConfig.pinned_status_msg_id && antreanPesan.length === 0 && !sedangSinkronisasi) return;
+    statusHpSaatIni = statusBaru;
+
+    let teksStatus = `🖥️ *COMMAND CENTER*\n\n📱 Koneksi WA: *${statusBaru}*\n📁 Batas Media: ${dbConfig.maxMediaMB} MB\n📦 Antrean: ${antreanPesan.length}`;
+    if (sedangSinkronisasi) teksStatus += `\n⏳ Sinkronisasi riwayat berjalan...`;
+
+    try {
+        if (dbConfig.pinned_status_msg_id) {
+            await safeTG(() => tgBot.editMessageText(teksStatus, { chat_id: TG_GROUP_ID, message_id: dbConfig.pinned_status_msg_id, parse_mode: 'Markdown' }));
+        } else {
+            const msg = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, teksStatus, { parse_mode: 'Markdown' }));
+            if (msg) {
+                dbConfig.pinned_status_msg_id = msg.message_id;
+                await simpanKonfigurasiDB();
+                await safeTG(() => tgBot.pinChatMessage(TG_GROUP_ID, msg.message_id, { disable_notification: true }));
+            }
+        }
+    } catch (e) {
+        dbConfig.pinned_status_msg_id = null;
+    }
+}
+
+// =========================================================================
+// COMMAND TELEGRAM
+// =========================================================================
 tgBot.on('message', async (msg) => {
     if (msg.chat.id.toString() !== TG_GROUP_ID || msg.from.is_bot) return;
     const threadId = msg.message_thread_id;
-    const targetJid = Object.keys(dbConfig.topik).find(k => dbConfig.topik[k] === threadId);
-    
+    const targetJid = Object.keys(dbConfig.topik).find((k) => dbConfig.topik[k] === threadId);
     const teks = msg.text || msg.caption || '';
-    const args = teks.split(' '); 
-    const cmd = args[0].split('@')[0].toLowerCase(); 
+    const args = teks.split(' ');
+    const cmd = args[0].split('@')[0].toLowerCase();
+
+    if (cmd === '/help') {
+        const help = `🛠️ *MENU COMMAND*\n/status - Diagnostik server\n/setmedia [MB] - Atur batas ukuran media\n/info - Detail kontak topik ini\n/mute /unmute - Bisukan/aktifkan topik ini\n/login [nomor] - Tautkan/ganti nomor WA\n/restart - Restart bot`;
+        return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, help, { message_thread_id: threadId, parse_mode: 'Markdown' }));
+    }
 
     if (cmd === '/setmedia') {
         const mb = parseInt(args[1]);
-        if (isNaN(mb)) return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `⚠️ Ketik: \`/setmedia 30\``, { message_thread_id: threadId, parse_mode: 'Markdown' }));
-        dbConfig.maxMediaMB = mb; await simpanKonfigurasiDB(); perbaruiStatusTelegram(statusHpSaatIni, true);
-        return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `✅ Batas unduhan media: **${mb} MB**.`, { message_thread_id: threadId, parse_mode: 'Markdown' }));
+        if (isNaN(mb) || mb <= 0) return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `⚠️ Ketik: \`/setmedia 10\``, { message_thread_id: threadId, parse_mode: 'Markdown' }));
+        dbConfig.maxMediaMB = mb;
+        await simpanKonfigurasiDB();
+        perbaruiStatusTelegram(statusHpSaatIni, true);
+        return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `✅ Batas media: *${mb} MB*`, { message_thread_id: threadId, parse_mode: 'Markdown' }));
     }
 
     if (cmd === '/info') {
+        if (!targetJid) return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `⚠️ Jalankan di dalam topik kontak.`, { message_thread_id: threadId }));
         const info = ambilInfoKontak(targetJid, null);
-        let ketLid = info.isLid ? '\n_*(Komunitas/Saluran WA Rahasia)*_' : '';
-        return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `ℹ️ **DETAIL KONTAK**\n\n👤 Nama Asli/Phonebook: ${info.nama}\n📞 Nomor: \`${info.isLid ? 'LID' : '+' + info.nomor}\`\n💬 Tipe: ${info.isGrup ? 'Grup' : 'Pribadi'}\n🆔 JID: \`${targetJid || 'Belum ada'}\`${ketLid}`, { message_thread_id: threadId, parse_mode: 'Markdown' }));
+        const ketLid = info.isLid ? '\n_(Komunitas/Saluran WA — nomor asli disembunyikan WhatsApp)_' : '';
+        return safeTG(() => tgBot.sendMessage(TG_GROUP_ID,
+            `ℹ️ *DETAIL KONTAK*\n\n👤 Nama: ${info.nama}\n📞 Nomor: \`${info.isLid ? 'LID' : '+' + info.nomor}\`\n💬 Tipe: ${info.isGrup ? 'Grup' : 'Pribadi'}\n🆔 JID: \`${targetJid}\`${ketLid}`,
+            { message_thread_id: threadId, parse_mode: 'Markdown' }));
     }
 
-    if (cmd === '/stealth') { dbConfig.stealthMode = !dbConfig.stealthMode; await simpanKonfigurasiDB(); perbaruiStatusTelegram(statusHpSaatIni, true); return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🛡️ Stealth Mode: ${dbConfig.stealthMode ? '🟢 ON' : '🔴 OFF'}`, { message_thread_id: threadId })); }
-    if (cmd === '/status') { return tgBot.sendMessage(TG_GROUP_ID, `📊 RAM Terpakai: ${(process.memoryUsage().rss / 1024 / 1024).toFixed(2)} MB\n📦 Batas Media: ${dbConfig.maxMediaMB} MB\n🔌 WA: ${globalSock ? 'Terhubung' : 'Terputus'}`, { message_thread_id: threadId }); }
-    if (cmd === '/mute' && targetJid) { if (!dbConfig.muted.includes(targetJid)) dbConfig.muted.push(targetJid); await simpanKonfigurasiDB(); return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🔇 Topik dibisukan.`, { message_thread_id: threadId })); }
-    if (cmd === '/unmute' && targetJid) { dbConfig.muted = dbConfig.muted.filter(j => j !== targetJid); await simpanKonfigurasiDB(); return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🔊 Topik aktif.`, { message_thread_id: threadId })); }
+    if (cmd === '/status') {
+        const ram = (process.memoryUsage().rss / 1024 / 1024).toFixed(2);
+        return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📊 RAM: ${ram} MB\n📁 Batas Media: ${dbConfig.maxMediaMB} MB\n🔌 WA: ${globalSock ? 'Terhubung' : 'Terputus'}\n📦 Antrean: ${antreanPesan.length}`, { message_thread_id: threadId }));
+    }
+
+    if (cmd === '/mute' && targetJid) {
+        if (!dbConfig.muted.includes(targetJid)) dbConfig.muted.push(targetJid);
+        await simpanKonfigurasiDB();
+        return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🔇 Topik dibisukan.`, { message_thread_id: threadId }));
+    }
+    if (cmd === '/unmute' && targetJid) {
+        dbConfig.muted = dbConfig.muted.filter((j) => j !== targetJid);
+        await simpanKonfigurasiDB();
+        return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🔊 Topik aktif.`, { message_thread_id: threadId }));
+    }
+
     if (cmd === '/login') {
         const nomor = args[1]?.replace(/[^0-9]/g, '');
         if (!nomor) return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `⚠️ Format: \`/login 628123456789\``, { message_thread_id: threadId, parse_mode: 'Markdown' }));
-        dbConfig.nomorWaUtama = nomor; await simpanKonfigurasiDB();
-        try {
-            let kode = await globalSock.requestPairingCode(nomor); kode = kode?.match(/.{1,4}/g)?.join('-') || kode;
-            return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🔑 *KODE PAIRING:* \`${kode}\``, { message_thread_id: threadId, parse_mode: 'Markdown' }));
-        } catch (e) {}
-    }
-    if (cmd === '/restart') process.exit(1);
+        if (!globalSock) return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `⚠️ Socket belum siap, tunggu sebentar.`, { message_thread_id: threadId }));
+        if (globalSock.authState.creds.registered) return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `✅ Sudah login. Pakai /login lagi setelah logout kalau mau ganti nomor.`, { message_thread_id: threadId }));
 
-    // MENGIRIM PESAN & MEDIA DARI TELEGRAM KE WA
+        dbConfig.nomor_wa_utama = nomor;
+        await simpanKonfigurasiDB();
+        try {
+            let kode = await globalSock.requestPairingCode(nomor);
+            kode = kode?.match(/.{1,4}/g)?.join('-') || kode;
+            return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🔑 *KODE PAIRING:* \`${kode}\`\nMasukkan di WhatsApp > Perangkat Tertaut dlm 60 detik.`, { message_thread_id: threadId, parse_mode: 'Markdown' }));
+        } catch (e) {
+            return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal: ${e.message}`, { message_thread_id: threadId }));
+        }
+    }
+
+    if (cmd === '/restart') {
+        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🔄 Restarting...`, { message_thread_id: threadId }));
+        process.exit(1);
+    }
+
+    // ---- BALAS KE WA (teks & media) DARI TELEGRAM ----
     if (targetJid && globalSock && !teks.startsWith('/')) {
-        await globalSock.sendPresenceUpdate('composing', targetJid); await delay(2000); await globalSock.sendPresenceUpdate('paused', targetJid);
-        
+        // Indikator "sedang mengetik" ini JUJUR: memang sesaat sebelum bot benar-benar
+        // mengirim pesan, bukan sinyal palsu yang tidak merefleksikan aksi nyata.
+        await globalSock.sendPresenceUpdate('composing', targetJid);
+        await delay(1200);
+        await globalSock.sendPresenceUpdate('paused', targetJid);
+
         let msgOptions = { text: teks };
         const hasMedia = msg.photo || msg.video || msg.document || msg.audio || msg.voice;
 
@@ -274,392 +362,498 @@ tgBot.on('message', async (msg) => {
             }
 
             const sent = await globalSock.sendMessage(targetJid, msgOptions);
-            botSentCache.set(sent.key.id, true); 
-            msgMapCache.set(sent.key.id, { tgMsgId: msg.message_id, threadId: threadId });
-            await setTGReaction(msg.message_id, '⏳'); 
-
+            msgMapCache.set(sent.key.id, { tgMsgId: msg.message_id, threadId });
         } catch (e) {
-            safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal mengirim: ${e.message}`, { reply_to_message_id: msg.message_id, message_thread_id: threadId }));
-        }
-    }
-});
-
-tgBot.on('message_reaction', async (reaction) => {
-    if (reaction.new_reaction.some(r => r.emoji === '👀')) {
-        const threadId = reaction.message_thread_id;
-        const targetJid = Object.keys(dbConfig.topik).find(k => dbConfig.topik[k] === threadId);
-        if (targetJid && globalSock) {
-            await globalSock.sendPresenceUpdate('available', targetJid);
-            await delay(1500); await globalSock.sendPresenceUpdate('unavailable', targetJid);
-            safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `✅ Centang biru (Read) dipaksa kirim.`, { message_thread_id: threadId }));
+            console.error('[KIRIM WA ERROR]', e.message);
+            await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal kirim: ${e.message}`, { message_thread_id: threadId }));
         }
     }
 });
 
 // =========================================================================
-// DEEP SCAN UNWRAPPER: PEMBOBOL VIEW ONCE & STATUS JID
+// ANTREAN PENGIRIMAN KE TELEGRAM
 // =========================================================================
-function bukaBrankasWA(messageObj) {
-    if (!messageObj) return { isViewOnce: false, actualMessage: {}, statusJidList: [] };
-    let actualMessage = messageObj;
-    let isViewOnce = false;
-
-    if (actualMessage.documentWithCaptionMessage) actualMessage = actualMessage.documentWithCaptionMessage.message;
-    if (actualMessage.ephemeralMessage) actualMessage = actualMessage.ephemeralMessage.message;
-    if (actualMessage.ptvMessage) actualMessage = actualMessage.ptvMessage;
-
-    const viewOnceKeys = ['viewOnceMessage', 'viewOnceMessageV2', 'viewOnceMessageV2Extension'];
-    let key = Object.keys(actualMessage).find(k => viewOnceKeys.includes(k));
-    if (key) {
-        isViewOnce = true;
-        actualMessage = actualMessage[key].message;
-    }
-
-    let statusJidList = [];
-    const cInfo = actualMessage?.extendedTextMessage?.contextInfo || actualMessage?.imageMessage?.contextInfo || actualMessage?.videoMessage?.contextInfo;
-    if (cInfo && (cInfo.statusJidList || cInfo.bcastJidList)) {
-        statusJidList = cInfo.statusJidList || cInfo.bcastJidList;
-    }
-
-    return { isViewOnce, actualMessage, statusJidList };
-}
-
-// =========================================================================
-// SISTEM ANTREAN PESAN
-// =========================================================================
-async function masukAntrean(infoPesan, pushName = 'Kontak', isFromMe = false) {
-    antreanPesan.push({ infoPesan, pushName, isFromMe });
+async function masukAntrean(infoPesan, pushName = 'Kontak', isHistory = false) {
+    antreanPesan.push({ infoPesan, pushName, isHistory });
     if (!sedangMemprosesAntrean) jalankanPekerjaAntrean();
 }
 
 async function jalankanPekerjaAntrean() {
     sedangMemprosesAntrean = true;
     while (antreanPesan.length > 0) {
-        const { infoPesan, pushName, isFromMe } = antreanPesan[0];
-        await eksekusiKirimKeTelegram(infoPesan, pushName, isFromMe);
+        const { infoPesan, pushName, isHistory } = antreanPesan[0];
+        await eksekusiKirimKeTelegram(infoPesan, pushName, isHistory);
         antreanPesan.shift();
-        if (antreanPesan.length % 5 === 0) perbaruiStatusTelegram(statusHpSaatIni);
-        await delay(500);
+        if (antreanPesan.length % 10 === 0) perbaruiStatusTelegram(statusHpSaatIni);
+        await delay(isHistory ? 1500 : 500);
+        if (global.gc && antreanPesan.length % 20 === 0) global.gc();
     }
     sedangMemprosesAntrean = false;
     perbaruiStatusTelegram(statusHpSaatIni);
 }
 
-async function eksekusiKirimKeTelegram(infoPesan, pushName, isFromMe) {
+async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory) {
     const idPengirim = infoPesan.key.remoteJid;
-    if (dbConfig.muted.includes(idPengirim)) return; 
+    if (dbConfig.muted.includes(idPengirim)) return;
 
-    if (!dbConfig.contacts[idPengirim] && pushName && pushName !== 'Kontak') {
-        dbConfig.contacts[idPengirim] = pushName; simpanKonfigurasiDB();
+    let threadId;
+    try {
+        threadId = await pastikanTopik(idPengirim, pushName);
+    } catch (e) {
+        return;
     }
+    const opts = { message_thread_id: threadId };
+    const awalan = isHistory ? '🕰️ [Riwayat] ' : '';
 
-    let threadId = await pastikanTopik(idPengirim, pushName);
-    const opts = threadId ? { message_thread_id: threadId } : {}; 
-    
-    const { isViewOnce, actualMessage } = bukaBrankasWA(infoPesan.message);
-    const tipePesan = Object.keys(actualMessage || {}).find(k => k !== 'senderKeyDistributionMessage' && k !== 'messageContextInfo');
-    
+    const isiPesan = infoPesan.message;
+    const tipePesan = Object.keys(isiPesan).find((k) => k !== 'senderKeyDistributionMessage' && k !== 'messageContextInfo');
     if (!tipePesan) return;
 
-    const infoSenderRaw = ambilInfoKontak(idPengirim, pushName);
+    // Info nama pengirim di dalam grup (kalau pesan berasal dari grup)
     let namaPengirimGrup = '';
-    if (infoSenderRaw.isGrup && infoPesan.key.participant) {
-        const partInfo = ambilInfoKontak(infoPesan.key.participant, null);
-        namaPengirimGrup = `👤 *[${partInfo.nama}]*:\n`;
+    const infoUtama = ambilInfoKontak(idPengirim, pushName);
+    if (infoUtama.isGrup && infoPesan.key.participant) {
+        const infoPengirim = ambilInfoKontak(infoPesan.key.participant, infoPesan.pushName);
+        namaPengirimGrup = `👤 *[${infoPengirim.nama}]*:\n`;
     }
 
-    if (tipePesan === 'reactionMessage') {
-        const emoji = actualMessage.reactionMessage.text;
-        const targetId = actualMessage.reactionMessage.key.id;
-        
-        let senderName = isFromMe ? 'ANDA SENDIRI' : infoSenderRaw.nama;
-        if (infoSenderRaw.isGrup && infoPesan.key.participant) {
-            senderName = ambilInfoKontak(infoPesan.key.participant, null).nama;
-        }
-
-        const statMem = statusMemory.get(targetId);
-        if (statMem) {
-            await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `[Reaksi: ${emoji}] dari${senderName} pada Status Anda:\n👉 _"${statMem.teks || 'Media Status'}"_`, { message_thread_id: dbConfig.sysTopics.statusWA, parse_mode: 'Markdown' }));
-            return;
-        }
-
-        const targetMsg = cacheAntiDelete.get(targetId);
-        const teksAsli = targetMsg ? targetMsg.teks : 'Pesan Lama';
-        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `[Reaksi: ${emoji}] dari ${senderName}\n👉 _"${teksAsli}"_`, { ...opts, parse_mode: 'Markdown' }));
+    // ---- REAKSI EMOJI (netral, hanya melaporkan; TIDAK memaksa sinyal apa pun) ----
+    if (isiPesan.reactionMessage) {
+        const emoji = isiPesan.reactionMessage.text || '(dihapus)';
+        const targetId = isiPesan.reactionMessage.key.id;
+        const dataAsli = cacheAntiDelete.get(targetId);
+        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${awalan}[Reaksi ${emoji}] pada: "_${dataAsli?.teks || 'pesan/media'}_"`, { ...opts, parse_mode: 'Markdown' }));
         return;
     }
 
-    const teksKonten = actualMessage.conversation || actualMessage.extendedTextMessage?.text || actualMessage[tipePesan]?.caption || '';
-    cacheAntiDelete.set(infoPesan.key.id, { teks: teksKonten, tipe: tipePesan });
-
-    const contextInfo = actualMessage.extendedTextMessage?.contextInfo || actualMessage.imageMessage?.contextInfo || actualMessage.videoMessage?.contextInfo || actualMessage.documentMessage?.contextInfo;
-    let quoteBlock = '';
-    
-    const botJid = globalSock?.user?.id?.split(':')[0] + '@s.whatsapp.net';
-    if (contextInfo && contextInfo.stanzaId && contextInfo.participant === botJid && contextInfo.remoteJid === 'status@broadcast') {
-        const statMem = statusMemory.get(contextInfo.stanzaId);
-        quoteBlock = '> 📝 *Membalas Status Anda:* _' + (contextInfo.quotedMessage?.conversation || statMem?.teks || '[Media Status]') + '_\n\n';
-    } 
-    else if (contextInfo && contextInfo.quotedMessage) {
-        const qTeks = contextInfo.quotedMessage.conversation || contextInfo.quotedMessage.extendedTextMessage?.text || '[Media]';
-        quoteBlock = '> 📝 *Membalas:* _' + qTeks + '_\n\n';
+    // ---- VIEW-ONCE: catat kehadirannya SAJA, jangan bongkar/simpan isinya ----
+    const viewOnceKeys = ['viewOnceMessage', 'viewOnceMessageV2', 'viewOnceMessageV2Extension'];
+    if (viewOnceKeys.includes(tipePesan)) {
+        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID,
+            `${awalan}👁️ ${namaPengirimGrup}Mengirim pesan/media sekali-lihat. Sesuai desain WhatsApp, isinya tidak diteruskan atau disimpan oleh bot ini.`,
+            { ...opts, parse_mode: 'Markdown' }));
+        return;
     }
 
-    const tagNotice = (!isFromMe && (contextInfo?.mentionedJid || []).includes(botJid)) ? `🔔 *[ANDA DI-MENTION]*\n\n` : '';
-    const viewOnceTag = isViewOnce ? `👁️ *[PESAN SEKALI LIHAT]*\n` : '';
-    const fromMeTag = isFromMe ? `📤 *[DARI HP UTAMA]*\n` : '';
+    // ---- LOKASI ----
+    if (isiPesan.locationMessage) {
+        const loc = isiPesan.locationMessage;
+        await safeTG(() => tgBot.sendLocation(TG_GROUP_ID, loc.degreesLatitude, loc.degreesLongitude, opts));
+        if (loc.name) await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📍 ${loc.name}`, opts));
+        return;
+    }
+    if (isiPesan.liveLocationMessage) {
+        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${awalan}📍 Membagikan lokasi langsung (tidak diteruskan real-time).`, opts));
+        return;
+    }
 
-    const pesanMedia = actualMessage.imageMessage || actualMessage.videoMessage || actualMessage.documentMessage || actualMessage.audioMessage || actualMessage.ptvMessage;
+    // ---- KONTAK ----
+    if (isiPesan.contactMessage) {
+        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${awalan}👤 Membagikan kontak: *${isiPesan.contactMessage.displayName}*`, { ...opts, parse_mode: 'Markdown' }));
+        return;
+    }
+    if (isiPesan.contactsArrayMessage) {
+        const jumlah = isiPesan.contactsArrayMessage.contacts?.length || 0;
+        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${awalan}👥 Membagikan ${jumlah} kontak`, opts));
+        return;
+    }
 
+    // ---- POLLING ----
+    if (isiPesan.pollCreationMessage || isiPesan.pollCreationMessageV3) {
+        const poll = isiPesan.pollCreationMessage || isiPesan.pollCreationMessageV3;
+        const daftarOpsi = (poll.options || []).map((o) => `• ${o.optionName}`).join('\n');
+        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${awalan}📊 *Polling:* ${poll.name}\n${daftarOpsi}`, { ...opts, parse_mode: 'Markdown' }));
+        return;
+    }
+
+    // ---- STIKER ----
+    if (isiPesan.stickerMessage) {
+        try {
+            const stream = await downloadContentFromMessage(isiPesan.stickerMessage, 'sticker');
+            let buffer = Buffer.alloc(0);
+            for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+            await safeTG(() => tgBot.sendSticker(TG_GROUP_ID, buffer, opts));
+        } catch (e) { console.error('[STIKER ERROR]', e.message); }
+        return;
+    }
+
+    const teksKonten = isiPesan.conversation || isiPesan.extendedTextMessage?.text || isiPesan[tipePesan]?.caption || '';
+    cacheAntiDelete.set(infoPesan.key.id, { teks: teksKonten, tipe: tipePesan });
+
+    // ---- QUOTE / REPLY ----
+    const contextInfo = isiPesan.extendedTextMessage?.contextInfo || isiPesan.imageMessage?.contextInfo || isiPesan.videoMessage?.contextInfo || isiPesan.documentMessage?.contextInfo;
+    let quoteBlock = '';
+    const botJid = globalSock?.user?.id?.split(':')[0] + '@s.whatsapp.net';
+
+    if (contextInfo?.stanzaId && contextInfo.participant === botJid && contextInfo.remoteJid === 'status@broadcast') {
+        const statMem = statusMemory.get(contextInfo.stanzaId);
+        quoteBlock = `> 📝 *Membalas Status Anda:* _${contextInfo.quotedMessage?.conversation || statMem?.teks || '[Media Status]'}_\n\n`;
+    } else if (contextInfo?.quotedMessage) {
+        const qTeks = contextInfo.quotedMessage.conversation || contextInfo.quotedMessage.extendedTextMessage?.text || '[Media]';
+        quoteBlock = `> 📝 *Membalas:* _${qTeks}_\n\n`;
+    }
+    const tagNotice = (contextInfo?.mentionedJid || []).includes(botJid) ? `🔔 *[ANDA DI-MENTION]*\n\n` : '';
+
+    // ---- MEDIA UMUM ----
+    const pesanMedia = isiPesan.imageMessage || isiPesan.videoMessage || isiPesan.documentMessage || isiPesan.audioMessage || isiPesan.ptvMessage;
     try {
         if (pesanMedia) {
             const ukuranBytes = parseInt(pesanMedia.fileLength || 0);
-            if (ukuranBytes > (dbConfig.maxMediaMB * 1024 * 1024)) {
-                await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${fromMeTag}⚠️ [Media Dilewati] Ukuran melebihi ${dbConfig.maxMediaMB} MB.`, opts));
+            if (ukuranBytes > dbConfig.maxMediaMB * 1024 * 1024) {
+                await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${awalan}⚠️ [Media Dilewati] Ukuran melebihi ${dbConfig.maxMediaMB} MB.`, opts));
                 return;
             }
-            
-            let tipeMediaUnduh = '';
-            if (actualMessage.imageMessage) tipeMediaUnduh = 'image';
-            else if (actualMessage.videoMessage || actualMessage.ptvMessage) tipeMediaUnduh = 'video';
-            else if (actualMessage.documentMessage) tipeMediaUnduh = 'document';
-            else if (actualMessage.audioMessage) tipeMediaUnduh = 'audio';
+            let tipeUnduh = '';
+            if (isiPesan.imageMessage) tipeUnduh = 'image';
+            else if (isiPesan.videoMessage || isiPesan.ptvMessage) tipeUnduh = 'video';
+            else if (isiPesan.documentMessage) tipeUnduh = 'document';
+            else if (isiPesan.audioMessage) tipeUnduh = 'audio';
 
-            const streamMedia = await downloadContentFromMessage(pesanMedia, tipeMediaUnduh);
-            let bufferMedia = Buffer.alloc(0);
-            for await (const chunk of streamMedia) bufferMedia = Buffer.concat([bufferMedia, chunk]);
+            const stream = await downloadContentFromMessage(pesanMedia, tipeUnduh);
+            let buffer = Buffer.alloc(0);
+            for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
 
-            await safeTG(() => tgBot.sendDocument(TG_GROUP_ID, bufferMedia, 
-                { ...opts, caption: `${tagNotice}${viewOnceTag}${fromMeTag}${namaPengirimGrup}${quoteBlock}${teksKonten}`, parse_mode: 'Markdown' },
-                { filename: `media_${infoPesan.key.id}` }
-            ));
+            await safeTG(() => tgBot.sendDocument(TG_GROUP_ID, buffer,
+                { ...opts, caption: `${tagNotice}${awalan}${namaPengirimGrup}${quoteBlock}${teksKonten}`, parse_mode: 'Markdown' },
+                { filename: `media_${infoPesan.key.id}` }));
         } else if (teksKonten.trim() !== '') {
-            await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}${viewOnceTag}${fromMeTag}${namaPengirimGrup}${quoteBlock}${teksKonten}`, { ...opts, parse_mode: 'Markdown' }));
+            await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}${awalan}${namaPengirimGrup}${quoteBlock}💬 ${teksKonten}`, { ...opts, parse_mode: 'Markdown' }));
         }
-    } catch (e) {}
+    } catch (e) {
+        console.error('[TG SEND ERROR]', e.message);
+    }
 }
 
 // =========================================================================
-// MESIN WHATSAPP UTAMA (Baileys)
+// MESIN WHATSAPP UTAMA
 // =========================================================================
 async function mulaiBotWhatsApp() {
-    const { state, saveCreds } = await useMongoDBAuthState();
-    const { version } = await fetchLatestBaileysVersion();
+    try {
+        const { state, saveCreds } = await useMongoDBAuthState();
+        const { version } = await fetchLatestBaileysVersion();
 
-    const sock = makeWASocket({
-        version, auth: state, printQRInTerminal: false, logger: pino({ level: 'silent' }),
-        browser: Browsers.ubuntu('Chrome'), markOnlineOnConnect: false, syncFullHistory: false 
-    });
-    globalSock = sock;
+        const sock = makeWASocket({
+            version,
+            auth: state,
+            printQRInTerminal: false,
+            logger: pino({ level: 'silent' }),
+            browser: Browsers.ubuntu('Chrome'),
+            connectTimeoutMs: 60000,
+            keepAliveIntervalMs: 20000,
+            syncFullHistory: false
+            // Sengaja TIDAK ada: markOnlineOnConnect:false + sendPresenceUpdate('unavailable') paksa,
+            // dan TIDAK ada patch sock.sendNode. Presence & status baca berjalan natural/default.
+        });
+        globalSock = sock;
 
-    const orgSendNode = sock.sendNode;
-    sock.sendNode = function (node) {
-        if (dbConfig.stealthMode && node.tag === 'receipt' && (node.attrs?.type === 'delivery' || node.attrs?.type === 'read')) return Promise.resolve(); 
-        return orgSendNode.apply(this, arguments);
-    };
-
-    sock.ev.on('contacts.upsert', (contacts) => {
-        let updated = false;
-        for (const contact of contacts) {
-            if (contact.name || contact.notify) { dbConfig.contacts[contact.id] = contact.name || contact.notify; updated = true; }
-        } if (updated) simpanKonfigurasiDB();
-    });
-    
-    sock.ev.on('contacts.update', (contacts) => {
-        let updated = false;
-        for (const contact of contacts) {
-            if (contact.name || contact.notify) { dbConfig.contacts[contact.id] = contact.name || contact.notify; updated = true; }
-        } if (updated) simpanKonfigurasiDB();
-    });
-
-    // MENYEDOT BUKU KONTAK SAAT AWAL KONEKSI (HISTORY SYNC)
-    sock.ev.on('messaging-history.set', ({ contacts }) => {
-        if (contacts) {
+        // ---- SINKRONISASI NAMA KONTAK & GRUP ASLI ----
+        sock.ev.on('contacts.upsert', async (contacts) => {
             for (const c of contacts) {
-                if (c.id && (c.name || c.notify)) dbConfig.contacts[c.id] = c.name || c.notify;
-            } simpanKonfigurasiDB();
-        }
-    });
+                const nama = c.name || c.notify;
+                if (nama) await renameTopikJikaPerlu(c.id, nama, false);
+            }
+        });
+        sock.ev.on('contacts.update', async (updates) => {
+            for (const c of updates) {
+                const nama = c.name || c.notify;
+                if (nama) await renameTopikJikaPerlu(c.id, nama, false);
+            }
+        });
+        sock.ev.on('groups.upsert', async (groups) => {
+            for (const g of groups) if (g.subject) await renameTopikJikaPerlu(g.id, g.subject, true);
+        });
+        sock.ev.on('groups.update', async (updates) => {
+            for (const g of updates) if (g.subject && g.id) await renameTopikJikaPerlu(g.id, g.subject, true);
+        });
 
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect } = update;
-        if (connection === 'connecting' && !sock.authState.creds.registered && !sedangMenungguPairing) {
-            sedangMenungguPairing = true; 
-            setTimeout(async () => {
-                if (!globalSock || sock.authState.creds.registered || sudahMemintaKode || !dbConfig.nomorWaUtama) return;
-                sudahMemintaKode = true;
-                try {
-                    const clean = dbConfig.nomorWaUtama.replace(/[^0-9]/g, '');
-                    let kode = await sock.requestPairingCode(clean); kode = kode?.match(/.{1,4}/g)?.join('-') || kode;
-                    await tgBot.sendMessage(TG_GROUP_ID, `⚠️ *KODE PAIRING:* \`${kode}\``, { parse_mode: 'Markdown' });
-                } catch (err) { sudahMemintaKode = false; }
-            }, 3000);
-        }
-        if (connection === 'close') {
-            globalSock = null; sedangMenungguPairing = false; sudahMemintaKode = false;
-            const status = lastDisconnect?.error?.output?.statusCode;
-            if (status === DisconnectReason.loggedOut || status === 401) {
-                try { await authCollection.deleteMany({}); } catch (e) {}
-                perbaruiStatusTelegram(`Logout - Perlu pairing ulang.`, true);
-            } else perbaruiStatusTelegram(`Terputus (${status || '?'}), reconnecting...`, true);
-            setTimeout(mulaiBotWhatsApp, 5000);
-        } else if (connection === 'open') {
-            sedangMenungguPairing = false; perbaruiStatusTelegram('Online (Stealth)');
-            await sock.sendPresenceUpdate('unavailable');
-        }
-    });
+        // ---- LAZY HISTORY SYNC (termasuk ekstraksi nama kontak dari riwayat) ----
+        let bufferRiwayat = [];
+        sock.ev.on('messaging-history.set', async ({ messages, contacts }) => {
+            if (contacts) {
+                for (const c of contacts) {
+                    const nama = c.name || c.notify;
+                    if (nama && c.id) dbConfig.kontak[c.id] = dbConfig.kontak[c.id] || nama;
+                }
+                await simpanKonfigurasiDB();
+            }
+            if (messages && messages.length > 0) {
+                bufferRiwayat.push(...messages.filter((m) => m.message && !m.key.fromMe));
+            }
+        });
 
-    sock.ev.on('creds.update', saveCreds);
+        setTimeout(function jadwalSinkronRiwayat() {
+            (async () => {
+                if (bufferRiwayat.length === 0) { setTimeout(jadwalSinkronRiwayat, 60000); return; }
+                sedangSinkronisasi = true;
+                perbaruiStatusTelegram(statusHpSaatIni, true);
 
-    sock.ev.on('call', async (calls) => {
-        for (const call of calls) {
-            const jid = call.from;
-            let st = call.status === 'offer' ? 'Berdering (Masuk)' : (call.status === 'reject' ? 'Ditolak' : (call.status === 'timeout' ? 'Tidak Terjawab' : call.status));
-            const info = ambilInfoKontak(jid, null);
-            await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📞 **[PANGGILAN ${call.isVideo ? 'VIDEO' : 'SUARA'}]**\n👤 Dari: ${info.nama}\n📋 Status: ${st}\n🕒 ${new Date().toLocaleString('id-ID')}`, { message_thread_id: dbConfig.sysTopics.audit }));
-        }
-    });
+                const perKontak = {};
+                for (const msg of bufferRiwayat) {
+                    const jid = msg.key.remoteJid;
+                    if (!perKontak[jid]) perKontak[jid] = [];
+                    if (perKontak[jid].length < HISTORY_BATCH_SIZE) perKontak[jid].push(msg);
+                }
+                bufferRiwayat = [];
 
-    sock.ev.on('presence.update', async (presence) => {
-        const jid = presence.id;
-        const state = presence.presences[Object.keys(presence.presences)[0]]?.lastKnownPresence;
-        const msgId = dbConfig.topicInfoMsgs[jid];
-        if (msgId) {
+                for (const jid of Object.keys(perKontak)) {
+                    const pesanTerurut = perKontak[jid].sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
+                    for (const msg of pesanTerurut) masukAntrean(msg, msg.pushName, true);
+                    await delay(3000);
+                }
+
+                sedangSinkronisasi = false;
+                perbaruiStatusTelegram(statusHpSaatIni, true);
+                setTimeout(jadwalSinkronRiwayat, 60 * 60 * 1000);
+            })();
+        }, HISTORY_SYNC_DELAY_MS);
+
+        // ---- STATUS ONLINE/TYPING KONTAK: mencerminkan info yg memang dikirim WA
+        // ke akun ini secara protokol normal, ditampilkan di pesan info topik yang di-pin.
+        sock.ev.on('presence.update', async (presence) => {
+            const jid = presence.id;
+            const state = presence.presences[Object.keys(presence.presences)[0]]?.lastKnownPresence;
+            const msgId = dbConfig.topicInfoMsgs[jid];
+            if (!msgId) return;
+
             const info = ambilInfoKontak(jid, null);
             let icon = '🔴 Offline';
             if (state === 'available') icon = '🟢 Online';
             else if (state === 'composing') icon = '✍️ Mengetik...';
             else if (state === 'recording') icon = '🎤 Merekam suara...';
-            safeTG(() => tgBot.editMessageText(`ℹ️ **INFO TOPIK**\nNama: ${info.nama}\nNomor: ${info.nomor}\nStatus: ${icon}`, { chat_id: TG_GROUP_ID, message_id: msgId, parse_mode: 'Markdown' }));
-        }
-    });
 
-    sock.ev.on('messages.update', async (updates) => {
-        for (const update of updates) {
-            if (update.key.remoteJid === 'status@broadcast' && update.update.status === 4) {
-                const viewerJid = update.key.participant;
-                const viewerName = ambilInfoKontak(viewerJid, null).nama;
-                const statMem = statusMemory.get(update.key.id);
-                safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `👀 **${viewerName}** melihat status Anda:\n👉 _"${statMem?.teks || 'Media'}"_`, { message_thread_id: dbConfig.sysTopics.statusWA, parse_mode: 'Markdown' }));
-                continue;
+            safeTG(() => tgBot.editMessageText(`ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor: +${info.nomor}\nStatus: ${icon}`,
+                { chat_id: TG_GROUP_ID, message_id: msgId, parse_mode: 'Markdown' }));
+        });
+
+        // ---- PAIRING ----
+        async function mintaKodePairing(retryCount = 0) {
+            try {
+                if (!globalSock || sock.authState.creds.registered || sudahMemintaKode || !dbConfig.nomor_wa_utama) return;
+                sudahMemintaKode = true;
+                const nomor = dbConfig.nomor_wa_utama.replace(/[^0-9]/g, '');
+                let kode = await sock.requestPairingCode(nomor);
+                kode = kode?.match(/.{1,4}/g)?.join('-') || kode;
+                await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🔑 *KODE PAIRING:* \`${kode}\`\nNomor: ${nomor}`, { parse_mode: 'Markdown' }));
+            } catch (err) {
+                console.error(`[PAIRING ERROR] percobaan ke-${retryCount + 1}:`, err.message);
+                sudahMemintaKode = false;
+                if (retryCount < 3) setTimeout(() => mintaKodePairing(retryCount + 1), 5000);
+                else await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal pairing otomatis. Kirim /login [nomor] secara manual.`));
+            }
+        }
+
+        sock.ev.on('connection.update', async (update) => {
+            const { connection, lastDisconnect } = update;
+            console.log('[CONN UPDATE]', JSON.stringify({ connection, statusCode: lastDisconnect?.error?.output?.statusCode }));
+
+            if (connection === 'connecting' && !sock.authState.creds.registered && !sedangMenungguPairing && dbConfig.nomor_wa_utama) {
+                sedangMenungguPairing = true;
+                setTimeout(() => mintaKodePairing(0), 2000);
             }
 
-            if (update.update.status) {
-                const status = update.update.status;
-                const tgData = msgMapCache.get(update.key.id);
-                if (tgData) {
-                    if (status === 3) await setTGReaction(tgData.tgMsgId, '👍'); 
-                    if (status === 4) {
-                        await setTGReaction(tgData.tgMsgId, '👀'); 
-                        msgMapCache.del(update.key.id); 
+            if (connection === 'close') {
+                globalSock = null; sedangMenungguPairing = false; sudahMemintaKode = false;
+                const statusCode = lastDisconnect?.error?.output?.statusCode;
+                const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401;
+
+                if (isLoggedOut) {
+                    try { await authCollection.deleteMany({}); } catch (e) {}
+                    perbaruiStatusTelegram(`Logout (${statusCode}) - perlu /login ulang.`, true);
+                } else {
+                    perbaruiStatusTelegram(`Terputus (${statusCode || '?'}), menyambung ulang...`, true);
+                }
+                setTimeout(mulaiBotWhatsApp, 5000);
+            } else if (connection === 'open') {
+                sedangMenungguPairing = false;
+                perbaruiStatusTelegram('Online');
+                if (!sock.authState.creds.registered) {
+                    safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `⚠️ Terhubung tapi belum login. Kirim \`/login 628xxx\`.`, { parse_mode: 'Markdown' }));
+                }
+            }
+        });
+
+        sock.ev.on('creds.update', saveCreds);
+
+        // ---- PANGGILAN MASUK ----
+        sock.ev.on('call', async (calls) => {
+            for (const call of calls) {
+                const info = ambilInfoKontak(call.from, null);
+                const st = call.status === 'offer' ? 'Berdering (Masuk)' : call.status === 'reject' ? 'Ditolak' : call.status === 'timeout' ? 'Tidak Terjawab' : call.status;
+                await safeTG(() => tgBot.sendMessage(TG_GROUP_ID,
+                    `📞 [PANGGILAN ${call.isVideo ? 'VIDEO' : 'SUARA'}]\n👤 Dari: ${info.nama}\n📋 Status: ${st}\n🕒 ${new Date().toLocaleString('id-ID')}`,
+                    { message_thread_id: dbConfig.sysTopics.audit }));
+            }
+        });
+
+        // ---- ANGGOTA GRUP ----
+        sock.ev.on('group-participants.update', async (event) => {
+            try {
+                const threadId = await pastikanTopik(event.id);
+                const daftarNama = event.participants.map((p) => ambilInfoKontak(p, null).nama).join(', ');
+                const aksi = { add: '➕ Bergabung', remove: '➖ Keluar/dikeluarkan', promote: '⬆️ Dijadikan admin', demote: '⬇️ Admin dicabut' }[event.action] || event.action;
+                await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `👥 [GRUP] ${aksi}: ${daftarNama}`, { message_thread_id: threadId }));
+            } catch (e) { console.error('[GROUP EVENT ERROR]', e.message); }
+        });
+
+        // ---- STATUS/CENTANG PESAN YANG DIKIRIM BOT + VIEWER STATUS SENDIRI ----
+        sock.ev.on('messages.update', async (updates) => {
+            for (const update of updates) {
+                // Siapa yang melihat status WA milik akun ini (fitur bawaan WA - viewer list status sendiri)
+                if (update.key.remoteJid === 'status@broadcast' && update.update.status === 4) {
+                    const info = ambilInfoKontak(update.key.participant, null);
+                    const statMem = statusMemory.get(update.key.id);
+                    safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `👀 *${info.nama}* melihat status Anda:\n👉 _"${statMem?.teks || 'Media'}"_`,
+                        { message_thread_id: dbConfig.sysTopics.statusWA, parse_mode: 'Markdown' }));
+                    continue;
+                }
+
+                // Centang kirim/baca untuk pesan yang DIKIRIM BOT dari Telegram (bukan manipulasi -
+                // ini status asli pesan yg memang dikirim, ditampilkan via reaksi di pesan Telegram)
+                if (update.update.status) {
+                    const tgData = msgMapCache.get(update.key.id);
+                    if (tgData) {
+                        try {
+                            if (update.update.status === 3) {
+                                await fetch(`https://api.telegram.org/bot${TG_TOKEN}/setMessageReaction`, {
+                                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ chat_id: TG_GROUP_ID, message_id: tgData.tgMsgId, reaction: [{ type: 'emoji', emoji: '✅' }] })
+                                });
+                            } else if (update.update.status === 4) {
+                                await fetch(`https://api.telegram.org/bot${TG_TOKEN}/setMessageReaction`, {
+                                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ chat_id: TG_GROUP_ID, message_id: tgData.tgMsgId, reaction: [{ type: 'emoji', emoji: '👀' }] })
+                                });
+                                msgMapCache.del(update.key.id);
+                            }
+                        } catch (e) {}
                     }
                 }
-            }
-        }
-    });
 
-    sock.ev.on('messages.upsert', async (chatUpdate) => {
-        const infoPesan = chatUpdate.messages[0];
-        if (!infoPesan || !infoPesan.message) return;
-
-        const pushName = infoPesan.pushName || 'Kontak';
-        const jid = infoPesan.key.remoteJid;
-
-        const { isViewOnce, actualMessage, statusJidList } = bukaBrankasWA(infoPesan.message);
-
-        let isRevoke = false, isEdit = false, targetId = null, teksBaru = '';
-        if (infoPesan.message?.protocolMessage) {
-            const pt = infoPesan.message.protocolMessage;
-            if (pt.type === 0 || pt.type === 'REVOKE') { isRevoke = true; targetId = pt.key.id; }
-            if (pt.type === 14 || pt.type === 'MESSAGE_EDIT') { 
-                isEdit = true; targetId = pt.key.id; 
-                teksBaru = pt.editedMessage?.conversation || pt.editedMessage?.extendedTextMessage?.text || '(media)'; 
-            }
-        }
-        if (infoPesan.message?.editedMessage) {
-            const pt = infoPesan.message.editedMessage.message?.protocolMessage;
-            if (pt) {
-                isEdit = true; targetId = pt.key.id;
-                teksBaru = pt.editedMessage?.conversation || pt.editedMessage?.extendedTextMessage?.text || '(media)';
-            }
-        }
-
-        if (isRevoke || isEdit) {
-            const dataAsli = cacheAntiDelete.get(targetId);
-            const opts = dbConfig.topik[jid] ? { message_thread_id: dbConfig.topik[jid] } : {};
-            const infoS = ambilInfoKontak(jid, pushName);
-
-            if (isRevoke && targetId) { 
-                const note = `⚠️ [PESAN DIHAPUS]\n👉 Isi asli: "${dataAsli?.teks || 'Media'}"`;
-                await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, note, opts));
-                await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🗑️ **[AUDIT - HAPUS]**\nDari: ${infoS.nama}\n${note}`, { message_thread_id: dbConfig.sysTopics.audit }));
-            } else if (isEdit && targetId) { 
-                const note = `✏️ [PESAN DIEDIT]\n👉 Sblm: "${dataAsli?.teks || '?'}"\n👉 Ssdh: "${teksBaru}"`;
-                await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, note, opts));
-                await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📝 **[AUDIT - EDIT]**\nDari: ${infoS.nama}\n${note}`, { message_thread_id: dbConfig.sysTopics.audit }));
-                if (dataAsli) cacheAntiDelete.set(targetId, { ...dataAsli, teks: teksBaru });
-            }
-            return;
-        }
-
-        if (jid === 'status@broadcast') {
-            const isMyOwn = infoPesan.key.fromMe;
-            const pembuat = isMyOwn ? 'ANDA SENDIRI' : ambilInfoKontak(infoPesan.key.participant, infoPesan.pushName).nama;
-            
-            const teksKonten = actualMessage.conversation || actualMessage.extendedTextMessage?.text || '';
-            const pesanMedia = actualMessage.imageMessage || actualMessage.videoMessage;
-            
-            statusMemory.set(infoPesan.key.id, { teks: teksKonten, media: !!pesanMedia });
-
-            const privasiSatu = isMyOwn ? `\n🔒 _Dibagikan ke ${statusJidList.length} kontak_` : '';
-            const captionStatus = `📱 **Status: ${pembuat}**\n${teksKonten}${privasiSatu}`;
-            const optsStatus = { message_thread_id: dbConfig.sysTopics.statusWA };
-
-            let tipeMediaUnduh = '';
-            if (actualMessage.imageMessage) tipeMediaUnduh = 'image';
-            else if (actualMessage.videoMessage) tipeMediaUnduh = 'video';
-
-            if (pesanMedia && tipeMediaUnduh) {
-                try {
-                    const streamMedia = await downloadContentFromMessage(pesanMedia, tipeMediaUnduh);
-                    let bufferMedia = Buffer.alloc(0);
-                    for await (const chunk of streamMedia) bufferMedia = Buffer.concat([bufferMedia, chunk]);
-                    await safeTG(() => tgBot.sendDocument(TG_GROUP_ID, bufferMedia, { ...optsStatus, caption: captionStatus, parse_mode: 'Markdown' }));
-                } catch (e) { }
-            } else {
-                await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, captionStatus, { ...optsStatus, parse_mode: 'Markdown' }));
-            }
-
-            if (isMyOwn && statusJidList.length > 0) {
-                await delay(1000); 
-                let viewerList = statusJidList.map(j => '- ' + ambilInfoKontak(j, null).nama);
-                const chunkSize = 100; 
-                for (let i = 0; i < viewerList.length; i += chunkSize) {
-                    const chunk = viewerList.slice(i, i + chunkSize).join('\n');
-                    await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `👥 **Penerima Status Anda**:\n\n${chunk}`, { ...optsStatus, parse_mode: 'Markdown' }));
-                    await delay(500); 
+                // Anti-delete / anti-edit
+                const proto = update.update.protocolMessage;
+                if (proto?.type === 0) {
+                    const dataAsli = cacheAntiDelete.get(proto.key.id);
+                    const threadId = dbConfig.topik[proto.key.remoteJid];
+                    if (threadId) {
+                        const info = ambilInfoKontak(proto.key.remoteJid, null);
+                        const note = `⚠️ [PESAN DIHAPUS]\n👉 Isi asli: "${dataAsli?.teks || 'Media'}"`;
+                        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, note, { message_thread_id: threadId }));
+                        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🗑️ [AUDIT] Dari: ${info.nama}\n${note}`, { message_thread_id: dbConfig.sysTopics.audit }));
+                    }
+                } else if (proto?.type === 14) {
+                    const idTarget = proto.key.id;
+                    const dataAsli = cacheAntiDelete.get(idTarget);
+                    const teksBaru = proto.editedMessage?.conversation || proto.editedMessage?.extendedTextMessage?.text || '(tidak terbaca)';
+                    const threadId = dbConfig.topik[proto.key.remoteJid];
+                    if (threadId) {
+                        const info = ambilInfoKontak(proto.key.remoteJid, null);
+                        const note = `✏️ [PESAN DIEDIT]\n👉 Sebelum: "${dataAsli?.teks || '(tidak tercatat)'}"\n👉 Sesudah: "${teksBaru}"`;
+                        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, note, { message_thread_id: threadId }));
+                        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📝 [AUDIT] Dari: ${info.nama}\n${note}`, { message_thread_id: dbConfig.sysTopics.audit }));
+                    }
+                    if (dataAsli) cacheAntiDelete.set(idTarget, { ...dataAsli, teks: teksBaru });
                 }
             }
-            return;
-        }
+        });
 
-        if (infoPesan.key.fromMe) {
-            if (!msgMapCache.has(infoPesan.key.id)) {
-                masukAntrean(infoPesan, pushName, true); 
+        sock.ev.on('chats.delete', (ids) => {
+            console.log('[INFO] chats.delete diabaikan sengaja agar cadangan Telegram tetap utuh:', ids);
+        });
+
+        // ---- PESAN MASUK/KELUAR ----
+        sock.ev.on('messages.upsert', async (chatUpdate) => {
+            const infoPesan = chatUpdate.messages[0];
+            if (!infoPesan || !infoPesan.message) return;
+
+            const pushName = infoPesan.pushName || 'Kontak';
+            const jid = infoPesan.key.remoteJid;
+
+            // Status WA (story) - punya orang lain ATAU status sendiri yg baru diunggah
+            if (jid === 'status@broadcast') {
+                const isMyOwn = infoPesan.key.fromMe;
+                const infoPembuat = isMyOwn ? { nama: 'ANDA SENDIRI' } : ambilInfoKontak(infoPesan.key.participant, infoPesan.pushName);
+                const teksKonten = infoPesan.message.conversation || infoPesan.message.extendedTextMessage?.text || '';
+                const pesanMedia = infoPesan.message.imageMessage || infoPesan.message.videoMessage;
+                statusMemory.set(infoPesan.key.id, { teks: teksKonten, media: !!pesanMedia });
+
+                const contextInfo = infoPesan.message.extendedTextMessage?.contextInfo || infoPesan.message.imageMessage?.contextInfo || infoPesan.message.videoMessage?.contextInfo;
+                const statusJidList = contextInfo?.statusJidList || contextInfo?.bcastJidList || [];
+                const privasiInfo = isMyOwn ? `\n🔒 _Dibagikan ke ${statusJidList.length} kontak_` : '';
+                const caption = `📱 *Status: ${infoPembuat.nama}*\n${teksKonten}${privasiInfo}`;
+                const optsStatus = { message_thread_id: dbConfig.sysTopics.statusWA };
+
+                try {
+                    if (pesanMedia) {
+                        const tipeUnduh = infoPesan.message.imageMessage ? 'image' : 'video';
+                        const stream = await downloadContentFromMessage(pesanMedia, tipeUnduh);
+                        let buffer = Buffer.alloc(0);
+                        for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+                        await safeTG(() => tgBot.sendDocument(TG_GROUP_ID, buffer, { ...optsStatus, caption, parse_mode: 'Markdown' }));
+                    } else {
+                        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, caption, { ...optsStatus, parse_mode: 'Markdown' }));
+                    }
+                } catch (e) { console.error('[STATUS ERROR]', e.message); }
+
+                if (isMyOwn && statusJidList.length > 0) {
+                    await delay(800);
+                    const daftarPenerima = statusJidList.map((j) => `- ${ambilInfoKontak(j, null).nama}`);
+                    for (let i = 0; i < daftarPenerima.length; i += 100) {
+                        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `👥 *Penerima Status Anda:*\n\n${daftarPenerima.slice(i, i + 100).join('\n')}`, { ...optsStatus, parse_mode: 'Markdown' }));
+                        await delay(500);
+                    }
+                }
+                return;
             }
-            return;
-        }
 
-        masukAntrean(infoPesan, pushName, false);
-    });
+            if (infoPesan.key.fromMe) {
+                // Backup dua arah: pesan yg kamu kirim sendiri dari HP juga ikut tersalin,
+                // KECUALI yang memang baru saja dikirim BOT ini sendiri (hindari duplikat).
+                if (!msgMapCache.has(infoPesan.key.id)) {
+                    masukAntrean(infoPesan, pushName, false);
+                }
+                return;
+            }
+
+            const idPesan = infoPesan.key.id;
+            if (cacheAntiSpam.has(idPesan)) return;
+            cacheAntiSpam.set(idPesan, true);
+
+            masukAntrean(infoPesan, pushName, false);
+        });
+    } catch (err) {
+        console.error('[WA INIT ERROR]', err.message);
+        setTimeout(mulaiBotWhatsApp, 10000);
+    }
 }
 
+// =========================================================================
+// EXPRESS SERVER, HEARTBEAT, GARBAGE COLLECTOR
+// =========================================================================
 setInterval(() => { if (global.gc) global.gc(); }, 120000);
 
+const startTimeBot = Date.now();
+setInterval(async () => {
+    if (!configCollection) return;
+    try {
+        await configCollection.updateOne(
+            { _id: 'heartbeat' },
+            { $set: {
+                connected: !!globalSock,
+                uptimeMs: Date.now() - startTimeBot,
+                ramMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+                queueLength: antreanPesan.length,
+                updatedAt: new Date()
+            } },
+            { upsert: true }
+        );
+    } catch (e) { console.error('[HEARTBEAT ERROR]', e.message); }
+}, 20000);
+
 const app = express();
-app.get('/', (req, res) => res.send('Stealth Bridge Beroperasi 🚀'));
+app.get('/', (req, res) => res.send('WA-Tele Bridge Aktif 🚀'));
 
 process.on('SIGTERM', async () => {
+    console.log('[SYS] Sinyal shutdown diterima.');
     if (globalSock) globalSock.end();
     await mongoClient.close();
     process.exit(0);
@@ -668,7 +862,7 @@ process.on('SIGTERM', async () => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🌐 Web server aktif di port ${PORT}.`);
-    setTimeout(() => {
-        hubungkanDatabase().then(() => mulaiBotWhatsApp()).catch(() => process.exit(1));
-    }, 5000);
+    hubungkanDatabase()
+        .then(() => mulaiBotWhatsApp())
+        .catch((e) => { console.error('[STARTUP ERROR]', e.message); process.exit(1); });
 });
