@@ -1,5 +1,5 @@
 // =========================================================================
-// INDEX.JS - WA-TELEGRAM STEALTH BRIDGE (ULTIMATE V17 - FULL PRECISION FIX)
+// INDEX.JS - WA-TELEGRAM STEALTH BRIDGE (ULTIMATE V18 - CACHE & GROUP FIX)
 // =========================================================================
 
 process.on('uncaughtException', (err) => console.error('[ANTI-CRASH] Uncaught Exception:', err.message));
@@ -403,6 +403,7 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName) {
     let threadId = await pastikanTopik(cleanJid, targetInfo.nama, targetInfo.nomor);
     const opts = threadId ? { message_thread_id: threadId } : {}; 
     
+    // PEMBUATAN NAMA PENGIRIM UNTUK GRUP
     let namaPengirimGrup = '';
     if (isGroup && infoPesan.key.participant) {
         const participantClean = jidNormalizedUser(infoPesan.key.participant);
@@ -413,13 +414,11 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName) {
     const { actualMsg, type, text, mediaObj, mediaType, isViewOnce } = extractMessageContent(infoPesan.message);
     if (!type) return;
 
-    // FITUR REAKSI & SUKA STATUS WA SEKALIGUS
     if (type === 'reactionMessage') {
         const emoji = actualMsg.reactionMessage.text;
         const sender = isGroup ? namaPengirimGrup.replace('👤 *[', '').replace(']*:\n', '') : (dbConfig.contacts[cleanJid] || pushName);
         const targetId = actualMsg.reactionMessage.key.id;
         
-        // Cek jika ini reaksi pada Status WA kita
         const statMem = statusMemory.get(targetId);
         if (statMem) {
             await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `[Reaksi Status: ${emoji}] dari ${sender}\n👉 _"${statMem.teks || '[Media Status]'}"_`, { message_thread_id: dbConfig.sysTopics.statusWA, parse_mode: 'Markdown' }));
@@ -432,9 +431,12 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName) {
         return;
     }
 
-    cacheAntiDelete.set(infoPesan.key.id, { teks: (text || '[Media/Non-Teks]'), tipe: type });
+    // NOTIFIKASI SEKALI LIHAT (TIDAK DIUNDUH)
+    if (isViewOnce) {
+        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `👁️ *[PESAN SEKALI LIHAT]*\n${namaPengirimGrup}Mengirim pesan/media sekali lihat. (Silakan buka di HP)`, { ...opts, parse_mode: 'Markdown' }));
+        return;
+    }
 
-    // FITUR QUOTE (TANGGAPAN STATUS WA & PESAN BIASA)
     const contextInfo = actualMsg.extendedTextMessage?.contextInfo || mediaObj?.contextInfo;
     let quoteBlock = '';
     const botJid = globalSock ? jidNormalizedUser(globalSock.user.id) : '';
@@ -443,7 +445,7 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName) {
         if (contextInfo.remoteJid === 'status@broadcast') {
             const statMem = statusMemory.get(contextInfo.stanzaId);
             const qTeks = contextInfo.quotedMessage?.conversation || contextInfo.quotedMessage?.extendedTextMessage?.text || statMem?.teks || '[Media Status]';
-            quoteBlock = `> 📝 *Membalas Status Anda:* _${qTeks}_\n\n`;
+            quoteBlock = `> 📝 *Membalas Status:* _${qTeks}_\n\n`;
         } else if (contextInfo.quotedMessage) {
             const qContent = extractMessageContent(contextInfo.quotedMessage);
             const qTeks = qContent.text || '[Media]';
@@ -452,7 +454,6 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName) {
     }
 
     const tagNotice = (contextInfo?.mentionedJid || []).includes(botJid) ? `🔔 *[ANDA DI-MENTION]*\n\n` : '';
-    const viewOnceTag = isViewOnce ? `👁️ *[PESAN SEKALI LIHAT]*\n` : '';
 
     try {
         if (mediaObj && mediaType) {
@@ -462,28 +463,20 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName) {
                 return;
             }
             
-            try {
-                const streamMedia = await downloadContentFromMessage(mediaObj, mediaType === 'sticker' ? 'sticker' : mediaType);
-                let bufferMedia = Buffer.alloc(0);
-                for await (const chunk of streamMedia) bufferMedia = Buffer.concat([bufferMedia, chunk]);
+            const streamMedia = await downloadContentFromMessage(mediaObj, mediaType === 'sticker' ? 'sticker' : mediaType);
+            let bufferMedia = Buffer.alloc(0);
+            for await (const chunk of streamMedia) bufferMedia = Buffer.concat([bufferMedia, chunk]);
 
-                if (mediaType === 'sticker') {
-                    await safeTG(() => tgBot.sendSticker(TG_GROUP_ID, bufferMedia, opts));
-                } else {
-                    await safeTG(() => tgBot.sendDocument(TG_GROUP_ID, bufferMedia, 
-                        { ...opts, caption: `${tagNotice}${viewOnceTag}${namaPengirimGrup}${quoteBlock}${text}`, parse_mode: 'Markdown' },
-                        { filename: `media_${infoPesan.key.id}` }
-                    ));
-                }
-            } catch (e) {
-                if (isViewOnce) {
-                    await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}👁️ *[NOTIFIKASI SEKALI LIHAT]*\n${namaPengirimGrup}Mengirim media sekali lihat. (Buka di HP)`, { ...opts, parse_mode: 'Markdown' }));
-                }
+            if (mediaType === 'sticker') {
+                await safeTG(() => tgBot.sendSticker(TG_GROUP_ID, bufferMedia, opts));
+            } else {
+                await safeTG(() => tgBot.sendDocument(TG_GROUP_ID, bufferMedia, 
+                    { ...opts, caption: `${tagNotice}${namaPengirimGrup}${quoteBlock}${text}`, parse_mode: 'Markdown' },
+                    { filename: `media_${infoPesan.key.id}` }
+                ));
             }
         } else if (text.trim() !== '') {
-            await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}${viewOnceTag}${namaPengirimGrup}${quoteBlock}${text}`, { ...opts, parse_mode: 'Markdown' }));
-        } else if (isViewOnce) {
-            await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}👁️ *[NOTIFIKASI SEKALI LIHAT]*\n${namaPengirimGrup}Mengirim pesan sekali lihat. (Buka di HP)`, { ...opts, parse_mode: 'Markdown' }));
+            await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}${namaPengirimGrup}${quoteBlock}${text}`, { ...opts, parse_mode: 'Markdown' }));
         }
     } catch (e) {}
 }
@@ -614,8 +607,32 @@ async function mulaiBotWhatsApp() {
 
             const pushName = infoPesan.pushName || 'Kontak';
             const cleanJid = jidNormalizedUser(infoPesan.key.remoteJid);
+            const msgId = infoPesan.key.id;
 
-            // FITUR 3 & 4: LOG AUDIT HAPUS & EDIT (Deep Protocol Unwrapper)
+            // 1. KUPAS PESAN & SIMPAN KE CACHE SECEPATNYA UNTUK ANTI-DELETE/EDIT
+            const { actualMsg, type, text, isViewOnce } = extractMessageContent(infoPesan.message);
+            const teksTersimpan = text || (actualMsg.imageMessage ? '[Foto]' : 
+                                  actualMsg.videoMessage ? '[Video]' : 
+                                  actualMsg.audioMessage ? '[Audio/Voice]' : 
+                                  actualMsg.documentMessage ? '[Dokumen]' : 
+                                  isViewOnce ? '[Pesan Sekali Lihat]' : '[Media/Pesan]');
+
+            // Simpan langsung (Mencakup pesan orang lain & pesan dari HP sendiri)
+            cacheAntiDelete.set(msgId, { teks: teksTersimpan, tipe: type });
+
+            // Identifikasi Pengirim Asli untuk Notif Audit
+            const isGroup = cleanJid.endsWith('@g.us');
+            let namaSender = dbConfig.contacts[cleanJid] || pushName;
+            let namaPengirimGrup = '';
+
+            if (isGroup && infoPesan.key.participant) {
+                const participantClean = jidNormalizedUser(infoPesan.key.participant);
+                namaSender = dbConfig.contacts[participantClean] || infoPesan.pushName || participantClean.split('@')[0];
+                namaPengirimGrup = `👤 *[${namaSender}]*:\n`;
+            }
+            if (infoPesan.key.fromMe) namaSender = 'Anda Sendiri';
+
+            // 2. FITUR LOG AUDIT HAPUS & EDIT
             let isEdit = false;
             let isRevoke = false;
             let protocolMsg = null;
@@ -634,16 +651,6 @@ async function mulaiBotWhatsApp() {
                     const idTarget = protocolMsg.key.id;
                     const dataAsli = cacheAntiDelete.get(idTarget);
                     const opts = dbConfig.topik[cleanJid] ? { message_thread_id: dbConfig.topik[cleanJid] } : {};
-                    
-                    const isGroup = cleanJid.endsWith('@g.us');
-                    let namaPengirimGrup = '';
-                    let namaSender = dbConfig.contacts[cleanJid] || pushName;
-
-                    if (isGroup && infoPesan.key.participant) {
-                        const participantClean = jidNormalizedUser(infoPesan.key.participant);
-                        namaSender = dbConfig.contacts[participantClean] || infoPesan.pushName || participantClean.split('@')[0];
-                        namaPengirimGrup = `👤 *[${namaSender}]*:\n`;
-                    }
 
                     if (isRevoke) { 
                         const note = `⚠️ *[PESAN DIHAPUS]*\n👉 ${dataAsli?.teks || '(Media / Tidak tercatat)'}`;
@@ -666,21 +673,20 @@ async function mulaiBotWhatsApp() {
                 const senderClean = jidNormalizedUser(infoPesan.key.participant);
                 const pembuat = isMyOwn ? 'ANDA SENDIRI' : (dbConfig.contacts[senderClean] || infoPesan.pushName || 'Unknown');
                 
-                const { text, mediaObj, mediaType } = extractMessageContent(infoPesan.message);
-                
                 // Simpan ID Status untuk ditanggapi
-                statusMemory.set(infoPesan.key.id, { teks: text, media: !!mediaObj });
+                statusMemory.set(infoPesan.key.id, { teks: text, media: !!actualMsg.imageMessage || !!actualMsg.videoMessage });
 
-                const contextInfo = infoPesan.message?.extendedTextMessage?.contextInfo || mediaObj?.contextInfo;
+                const contextInfo = actualMsg?.extendedTextMessage?.contextInfo || actualMsg?.imageMessage?.contextInfo || actualMsg?.videoMessage?.contextInfo;
                 const targetList = contextInfo?.statusJidList || contextInfo?.bcastJidList || [];
                 const privasiSatu = isMyOwn ? `\n🔒 _Dibagikan ke ${targetList.length} kontak_` : '';
                 
                 const captionStatus = `📱 **Status: ${pembuat}**\n${text}${privasiSatu}`;
                 const optsStatus = { message_thread_id: dbConfig.sysTopics.statusWA };
 
-                if (mediaObj && mediaType) {
+                if (actualMsg.imageMessage || actualMsg.videoMessage) {
+                    const mType = actualMsg.imageMessage ? 'image' : 'video';
                     try {
-                        const streamMedia = await downloadContentFromMessage(mediaObj, mediaType);
+                        const streamMedia = await downloadContentFromMessage(actualMsg[mType + 'Message'], mType);
                         let bufferMedia = Buffer.alloc(0);
                         for await (const chunk of streamMedia) bufferMedia = Buffer.concat([bufferMedia, chunk]);
                         await safeTG(() => tgBot.sendDocument(TG_GROUP_ID, bufferMedia, { ...optsStatus, caption: captionStatus, parse_mode: 'Markdown' }));
@@ -706,21 +712,21 @@ async function mulaiBotWhatsApp() {
                 return;
             }
 
+            // 4. PESAN DARI HP SENDIRI (TETAP KIRIM KE TOPIK)
             if (infoPesan.key.fromMe) {
-                if (botSentCache.has(infoPesan.key.id)) return; 
+                if (botSentCache.has(msgId)) return; 
                 try {
                     const threadId = await pastikanTopik(cleanJid, pushName, cleanJid.split('@')[0]);
-                    const outContent = extractMessageContent(infoPesan.message);
                     if (threadId) {
-                        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📤 (Dari HP): ${outContent.text || '[Media]'}`, { message_thread_id: threadId }));
+                        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📤 (Dari HP): ${teksTersimpan}`, { message_thread_id: threadId }));
                     }
                 } catch (e) {}
                 return;
             }
 
-            const idPesan = infoPesan.key.id;
-            if (cacheAntiSpam.has(idPesan)) return;
-            cacheAntiSpam.set(idPesan, true);
+            // 5. ANTREAN PESAN ORANG LAIN
+            if (cacheAntiSpam.has(msgId)) return;
+            cacheAntiSpam.set(msgId, true);
 
             masukAntrean(infoPesan, pushName);
         });
