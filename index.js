@@ -494,7 +494,7 @@ async function mulaiBotWhatsApp() {
             waVersion = version;
         } catch (e) {}
 
-        const sock = makeWASocket({
+                const sock = makeWASocket({
             version: waVersion, 
             auth: state, 
             printQRInTerminal: false, 
@@ -502,9 +502,15 @@ async function mulaiBotWhatsApp() {
             browser: Browsers.ubuntu('Chrome'), 
             markOnlineOnConnect: false, 
             syncFullHistory: false,
+            generateHighQualityLinkPreview: false, // Hemat RAM: Matikan pratinjau link otomatis
+            getMessage: async (key) => {
+                // Hemat RAM: Mencegah OOM saat ada pesan yang mengutip (reply) chat lama
+                return { conversation: 'Pesan Lama' };
+            },
             connectTimeoutMs: 60000,
             keepAliveIntervalMs: 20000
         });
+
         globalSock = sock;
 
         const orgSendNode = sock.sendNode;
