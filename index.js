@@ -1,5 +1,5 @@
 // =========================================================================
-// INDEX.JS - WA-TELEGRAM STEALTH BRIDGE (ULTIMATE V18 - CACHE & GROUP FIX)
+// INDEX.JS - WA-TELEGRAM STEALTH BRIDGE (ULTIMATE V19 - DEPLOY FIX)
 // =========================================================================
 
 process.on('uncaughtException', (err) => console.error('[ANTI-CRASH] Uncaught Exception:', err.message));
@@ -96,7 +96,7 @@ async function safeTG(apiCall) {
 }
 
 // =========================================================================
-// MONGODB & ADAPTER SESI TERMUX
+// MONGODB & ADAPTER SESI HEMAT MEMORI
 // =========================================================================
 const mongoClient = new MongoClient(MONGODB_URI, { serverSelectionTimeoutMS: 15000 });
 let authCollection, configCollection;
@@ -122,13 +122,25 @@ async function simpanKonfigurasiDB() {
     try { await configCollection.updateOne({ _id: 'global_settings' }, { $set: dbConfig }, { upsert: true }); } catch (e) {}
 }
 
+// FUNGSI BARU: Pemulih Buffer Hemat RAM (Menghindari JSON.parse yang berat)
+function restoreBuffer(data) {
+    if (data === null || typeof data !== 'object') return data;
+    if (data.type === 'Buffer' && Array.isArray(data.data)) {
+        return Buffer.from(data.data);
+    }
+    for (const key in data) {
+        data[key] = restoreBuffer(data[key]);
+    }
+    return data;
+}
+
 async function useMongoDBAuthState() {
     let creds; 
     try {
         const doc = await authCollection.findOne({ _id: 'creds' });
         if (doc) {
             const rawData = doc.data || doc; 
-            creds = JSON.parse(JSON.stringify(rawData), BufferJSON.reviver);
+            creds = restoreBuffer(rawData); // Menggunakan fungsi hemat RAM
         }
     } catch (e) {}
     
@@ -145,7 +157,7 @@ async function useMongoDBAuthState() {
                             const rec = await authCollection.findOne({ _id: `${type}-${id}` });
                             if (rec) {
                                 const val = rec.data || rec;
-                                data[id] = JSON.parse(JSON.stringify(val), BufferJSON.reviver);
+                                data[id] = restoreBuffer(val);
                             }
                         }));
                     } catch (e) {}
@@ -403,7 +415,6 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName) {
     let threadId = await pastikanTopik(cleanJid, targetInfo.nama, targetInfo.nomor);
     const opts = threadId ? { message_thread_id: threadId } : {}; 
     
-    // PEMBUATAN NAMA PENGIRIM UNTUK GRUP
     let namaPengirimGrup = '';
     if (isGroup && infoPesan.key.participant) {
         const participantClean = jidNormalizedUser(infoPesan.key.participant);
@@ -431,7 +442,6 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName) {
         return;
     }
 
-    // NOTIFIKASI SEKALI LIHAT (TIDAK DIUNDUH)
     if (isViewOnce) {
         await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `👁️ *[PESAN SEKALI LIHAT]*\n${namaPengirimGrup}Mengirim pesan/media sekali lihat. (Silakan buka di HP)`, { ...opts, parse_mode: 'Markdown' }));
         return;
@@ -463,17 +473,23 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName) {
                 return;
             }
             
-            const streamMedia = await downloadContentFromMessage(mediaObj, mediaType === 'sticker' ? 'sticker' : mediaType);
-            let bufferMedia = Buffer.alloc(0);
-            for await (const chunk of streamMedia) bufferMedia = Buffer.concat([bufferMedia, chunk]);
+            try {
+                const streamMedia = await downloadContentFromMessage(mediaObj, mediaType === 'sticker' ? 'sticker' : mediaType);
+                let bufferMedia = Buffer.alloc(0);
+                for await (const chunk of streamMedia) bufferMedia = Buffer.concat([bufferMedia, chunk]);
 
-            if (mediaType === 'sticker') {
-                await safeTG(() => tgBot.sendSticker(TG_GROUP_ID, bufferMedia, opts));
-            } else {
-                await safeTG(() => tgBot.sendDocument(TG_GROUP_ID, bufferMedia, 
-                    { ...opts, caption: `${tagNotice}${namaPengirimGrup}${quoteBlock}${text}`, parse_mode: 'Markdown' },
-                    { filename: `media_${infoPesan.key.id}` }
-                ));
+                if (mediaType === 'sticker') {
+                    await safeTG(() => tgBot.sendSticker(TG_GROUP_ID, bufferMedia, opts));
+                } else {
+                    await safeTG(() => tgBot.sendDocument(TG_GROUP_ID, bufferMedia, 
+                        { ...opts, caption: `${tagNotice}${namaPengirimGrup}${quoteBlock}${text}`, parse_mode: 'Markdown' },
+                        { filename: `media_${infoPesan.key.id}` }
+                    ));
+                }
+            } catch (e) {
+                if (isViewOnce) {
+                    await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}👁️ *[NOTIFIKASI SEKALI LIHAT]*\n${namaPengirimGrup}Mengirim media sekali lihat. (Buka di HP)`, { ...opts, parse_mode: 'Markdown' }));
+                }
             }
         } else if (text.trim() !== '') {
             await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}${namaPengirimGrup}${quoteBlock}${text}`, { ...opts, parse_mode: 'Markdown' }));
@@ -494,7 +510,7 @@ async function mulaiBotWhatsApp() {
             waVersion = version;
         } catch (e) {}
 
-                const sock = makeWASocket({
+        const sock = makeWASocket({
             version: waVersion, 
             auth: state, 
             printQRInTerminal: false, 
@@ -502,15 +518,9 @@ async function mulaiBotWhatsApp() {
             browser: Browsers.ubuntu('Chrome'), 
             markOnlineOnConnect: false, 
             syncFullHistory: false,
-            generateHighQualityLinkPreview: false, // Hemat RAM: Matikan pratinjau link otomatis
-            getMessage: async (key) => {
-                // Hemat RAM: Mencegah OOM saat ada pesan yang mengutip (reply) chat lama
-                return { conversation: 'Pesan Lama' };
-            },
             connectTimeoutMs: 60000,
             keepAliveIntervalMs: 20000
         });
-
         globalSock = sock;
 
         const orgSendNode = sock.sendNode;
@@ -615,7 +625,6 @@ async function mulaiBotWhatsApp() {
             const cleanJid = jidNormalizedUser(infoPesan.key.remoteJid);
             const msgId = infoPesan.key.id;
 
-            // 1. KUPAS PESAN & SIMPAN KE CACHE SECEPATNYA UNTUK ANTI-DELETE/EDIT
             const { actualMsg, type, text, isViewOnce } = extractMessageContent(infoPesan.message);
             const teksTersimpan = text || (actualMsg.imageMessage ? '[Foto]' : 
                                   actualMsg.videoMessage ? '[Video]' : 
@@ -623,10 +632,8 @@ async function mulaiBotWhatsApp() {
                                   actualMsg.documentMessage ? '[Dokumen]' : 
                                   isViewOnce ? '[Pesan Sekali Lihat]' : '[Media/Pesan]');
 
-            // Simpan langsung (Mencakup pesan orang lain & pesan dari HP sendiri)
             cacheAntiDelete.set(msgId, { teks: teksTersimpan, tipe: type });
 
-            // Identifikasi Pengirim Asli untuk Notif Audit
             const isGroup = cleanJid.endsWith('@g.us');
             let namaSender = dbConfig.contacts[cleanJid] || pushName;
             let namaPengirimGrup = '';
@@ -638,7 +645,6 @@ async function mulaiBotWhatsApp() {
             }
             if (infoPesan.key.fromMe) namaSender = 'Anda Sendiri';
 
-            // 2. FITUR LOG AUDIT HAPUS & EDIT
             let isEdit = false;
             let isRevoke = false;
             let protocolMsg = null;
@@ -669,17 +675,15 @@ async function mulaiBotWhatsApp() {
                         safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📝 **[AUDIT - EDIT]**\nDari: ${namaSender}\n${note}`, { message_thread_id: dbConfig.sysTopics.audit }));
                         if (dataAsli) cacheAntiDelete.set(idTarget, { ...dataAsli, teks: teksBaru });
                     }
-                    return; // Stop process, tidak perlu masuk antrean
+                    return; 
                 }
             }
 
-            // MEDIA & STATUS WA (BROADCAST)
             if (cleanJid === 'status@broadcast') {
                 const isMyOwn = infoPesan.key.fromMe;
                 const senderClean = jidNormalizedUser(infoPesan.key.participant);
                 const pembuat = isMyOwn ? 'ANDA SENDIRI' : (dbConfig.contacts[senderClean] || infoPesan.pushName || 'Unknown');
                 
-                // Simpan ID Status untuk ditanggapi
                 statusMemory.set(infoPesan.key.id, { teks: text, media: !!actualMsg.imageMessage || !!actualMsg.videoMessage });
 
                 const contextInfo = actualMsg?.extendedTextMessage?.contextInfo || actualMsg?.imageMessage?.contextInfo || actualMsg?.videoMessage?.contextInfo;
@@ -718,21 +722,21 @@ async function mulaiBotWhatsApp() {
                 return;
             }
 
-            // 4. PESAN DARI HP SENDIRI (TETAP KIRIM KE TOPIK)
             if (infoPesan.key.fromMe) {
                 if (botSentCache.has(msgId)) return; 
                 try {
                     const threadId = await pastikanTopik(cleanJid, pushName, cleanJid.split('@')[0]);
+                    const outContent = extractMessageContent(infoPesan.message);
                     if (threadId) {
-                        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📤 (Dari HP): ${teksTersimpan}`, { message_thread_id: threadId }));
+                        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📤 (Dari HP): ${outContent.text || '[Media]'}`, { message_thread_id: threadId }));
                     }
                 } catch (e) {}
                 return;
             }
 
-            // 5. ANTREAN PESAN ORANG LAIN
-            if (cacheAntiSpam.has(msgId)) return;
-            cacheAntiSpam.set(msgId, true);
+            const idPesan = infoPesan.key.id;
+            if (cacheAntiSpam.has(idPesan)) return;
+            cacheAntiSpam.set(idPesan, true);
 
             masukAntrean(infoPesan, pushName);
         });
@@ -742,7 +746,7 @@ async function mulaiBotWhatsApp() {
 }
 
 // =========================================================================
-// STARTUP SERVER AMAN
+// STARTUP SERVER AMAN DENGAN JEDA DETEKSI RENDER
 // =========================================================================
 setInterval(() => { if (global.gc) global.gc(); }, 120000);
 
@@ -758,10 +762,13 @@ process.on('SIGTERM', async () => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🌐 Web server aktif di port ${PORT}.`);
-    hubungkanDatabase()
-        .then(() => mulaiBotWhatsApp())
-        .catch((e) => { 
-            console.error('[STARTUP ERROR]', e.message); 
-            process.exit(1); 
-        });
+    // JEDA 5 DETIK: Membiarkan Render memverifikasi port agar server tidak dicap 'mati' (No open ports detected)
+    setTimeout(() => {
+        hubungkanDatabase()
+            .then(() => mulaiBotWhatsApp())
+            .catch((e) => { 
+                console.error('[STARTUP ERROR]', e.message); 
+                process.exit(1); 
+            });
+    }, 5000);
 });
