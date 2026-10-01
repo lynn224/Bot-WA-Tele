@@ -37,7 +37,6 @@ tgBot.on('polling_error', (err) => console.error('[TG POLLING]', err.message));
 tgBot.setMyCommands([
     { command: 'help', description: 'Daftar perintah' },
     { command: 'status', description: 'Cek RAM & koneksi' },
-    { command: 'stealth', description: 'Aktif/nonaktifkan mode stealth (on/off)' },
     { command: 'setmedia', description: 'Atur batas ukuran media (MB)' },
     { command: 'info', description: 'Detail kontak topik ini' },
     { command: 'mute', description: 'Bisukan topik ini' },
@@ -48,16 +47,25 @@ tgBot.setMyCommands([
 
 const cacheAntiSpam = new NodeCache({ stdTTL: 3600 });
 const cacheAntiDelete = new NodeCache({ stdTTL: 86400 });
+// Baileys kadang mengirim event hapus/edit lewat messages.upsert, kadang lewat messages.update,
+// tergantung siapa pelakunya (diri sendiri vs orang lain) dan konteks (pribadi vs grup).
+// Kita dengarkan KEDUANYA supaya tidak ada yang lolos, dan cache ini mencegah notifikasi dobel
+// kalau kebetulan kedua event terpicu untuk aksi yang sama.
 const cacheDedupProtokol = new NodeCache({ stdTTL: 120 });
 const statusMemory = new NodeCache({ stdTTL: 86400 });
 const msgMapCache = new NodeCache({ stdTTL: 86400 });
-// Pemetaan dua arah untuk fitur Reply Telegram -> WhatsApp Quoted Message
-const tgToWaMap = new NodeCache({ stdTTL: 86400 });
+// Pemetaan ID pesan Telegram -> pesan WA aslinya (key + message lengkap), untuk SETIAP
+// pesan yang diteruskan ke Telegram (bukan cuma yang bot kirim). Dipakai supaya kalau
+// kamu pakai fitur "Reply" asli Telegram ke pesan tertentu, bot bisa kirim quoted-reply
+// yang benar-benar menunjuk ke pesan WA itu, bukan cuma pesan baru biasa.
+const cacheTgMsgToWa = new NodeCache({ stdTTL: 3 * 86400 });
 
 let globalSock = null;
 let sedangMenungguPairing = false;
 let sudahMemintaKode = false;
+const lastSeenMap = {}; // { jid: timestamp|null } - in-memory, reset saat restart (bukan data permanen)
 
+// Konfigurasi tunggal, dipersist ke MongoDB (skema FLAT - kompatibel dgn dashboard yang sudah dibuat)
 let dbConfig = {
     topik: {},
     kontak: {},
@@ -66,8 +74,7 @@ let dbConfig = {
     nomor_wa_utama: process.env.NOMOR_WA_UTAMA || null,
     pinned_status_msg_id: null,
     maxMediaMB: 5,
-    topicInfoMsgs: {},
-    stealthMode: true // Default stealth aktif
+    topicInfoMsgs: {}
 };
 
 let statusHpSaatIni = 'Menghubungkan...';
@@ -94,11 +101,40 @@ async function safeTG(apiCall) {
     return null;
 }
 
+// Ekstrak nama & nomor dari teks vCard (format standar kontak yang dibagikan via WA).
+// Sumber nama tambahan: kalau seseorang share vCard yang nomornya cocok dengan kontak
+// yang sudah punya topik, nama dari vCard itu dipakai untuk memperbarui nama kontak.
+function parseVCard(vcardText) {
+    if (!vcardText) return null;
+    const namaMatch = vcardText.match(/FN:(.+)/);
+    const nama = namaMatch ? namaMatch[1].trim() : null;
+    const nomorList = [...vcardText.matchAll(/TEL[^:]*:([+()\d\s-]+)/g)].map((m) => m[1].replace(/[^\d]/g, '')).filter(Boolean);
+    if (!nama && nomorList.length === 0) return null;
+    return { nama, nomorList };
+}
+
+async function setTGReaksi(msgId, emoji) {
+    try {
+        await fetch(`https://api.telegram.org/bot${TG_TOKEN}/setMessageReaction`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ chat_id: TG_GROUP_ID, message_id: msgId, reaction: [{ type: 'emoji', emoji }] })
+        });
+    } catch (e) {
+        console.error('[TG REACTION ERROR]', e.message);
+    }
+}
+
+// Cek apakah pesan error dari Telegram menandakan topik sudah tidak ada lagi
+// (dihapus manual, atau ID basi karena grup pernah dihapus/diganti).
 function isErrorTopikBasi(pesanError) {
     if (!pesanError) return false;
     return pesanError.includes('thread not found') || pesanError.includes('TOPIC_ID_INVALID') || pesanError.includes('message thread not found');
 }
 
+// Kirim ke topik kontak/grup (jid) atau topik sistem (sysKey), dengan AUTO-HEAL:
+// kalau ID topik yang tersimpan ternyata sudah tidak valid lagi di sisi Telegram,
+// hapus mapping lama, buat topik baru, lalu kirim ulang ke topik yang baru.
 async function kirimKeTopik({ jid, sysKey }, kirimFn) {
     const ambilThreadIdSaatIni = () => (sysKey ? dbConfig.sysTopics[sysKey] : dbConfig.topik[jid]);
     const threadId = ambilThreadIdSaatIni();
@@ -208,7 +244,7 @@ async function useMongoDBAuthState() {
 }
 
 // =========================================================================
-// INFO KONTAK
+// INFO KONTAK (nama tersimpan HP > pushName > LID/nomor)
 // =========================================================================
 function ambilInfoKontak(jid, pushNameFallback) {
     if (!jid) return { nama: 'Unknown', nomor: 'Unknown', isLid: false, isGrup: false };
@@ -220,14 +256,17 @@ function ambilInfoKontak(jid, pushNameFallback) {
     if (!nama) {
         nama = isGrup ? `Grup ${nomor}` : (isLid ? 'Rahasia (LID)' : `+${nomor}`);
     } else if (!dbConfig.kontak[jid]) {
-        dbConfig.kontak[jid] = nama;
+        dbConfig.kontak[jid] = nama; // simpan pushName sbg fallback sementara, nanti di-upgrade oleh contacts.upsert
     }
     return { nama, nomor, isLid, isGrup };
 }
 
-// =========================================================================
-// PROTOKOL PESAN (HAPUS & EDIT)
-// =========================================================================
+// Deteksi & kirim notifikasi HAPUS/EDIT. Dipanggil dari messages.upsert MAUPUN
+// messages.update (lihat komentar di deklarasi cacheDedupProtokol di atas) supaya
+// tidak ada revoke/edit yang lolos tergantung dari mana event itu datang.
+//
+// @param protoMsg   - object protocolMessage { type, key: {id, remoteJid, ...}, editedMessage? }
+// @param jidPelaku  - JID yang melakukan aksi ini menurut event (participant di grup), boleh kosong
 async function prosesProtokolPesan(protoMsg, jidPelaku) {
     if (!protoMsg?.key?.id) return;
     const idTarget = protoMsg.key.id;
@@ -237,10 +276,10 @@ async function prosesProtokolPesan(protoMsg, jidPelaku) {
     if (!isHapus && !isEdit) return;
 
     const dedupKey = `${isHapus ? 'hapus' : 'edit'}-${idTarget}`;
-    if (cacheDedupProtokol.has(dedupKey)) return;
+    if (cacheDedupProtokol.has(dedupKey)) return; // event yang sama sudah diproses dari sumber lain
     cacheDedupProtokol.set(dedupKey, true);
 
-    if (!dbConfig.topik[jidChat]) return;
+    if (!dbConfig.topik[jidChat]) return; // belum pernah ada topik utk chat ini, tidak ada yg perlu dinotifikasi
 
     const dataAsli = cacheAntiDelete.get(idTarget);
     const namaPengirim = dataAsli?.pengirim
@@ -251,7 +290,6 @@ async function prosesProtokolPesan(protoMsg, jidPelaku) {
         note = `🗑️ *Pesan Dihapus*\n👤 Dari: ${namaPengirim}\n💬 Isi pesan: "${dataAsli?.teks || '(media, isi tidak tercatat)'}"`;
     } else {
         const teksBaru = protoMsg.editedMessage?.conversation || protoMsg.editedMessage?.extendedTextMessage?.text || '(media/tidak terbaca)';
-        // Baris yang benar:
         note = `✏️ *Pesan Diedit*\n👤 Dari: ${namaPengirim}\n📝 Sebelum: "${dataAsli?.teks || '(tidak tercatat)'}"\n📝 Sesudah: "${teksBaru}"`;
         if (dataAsli) cacheAntiDelete.set(idTarget, { ...dataAsli, teks: teksBaru });
     }
@@ -280,6 +318,9 @@ async function pastikanTopik(jid, pushName) {
 
     const isGrup = jid.endsWith('@g.us');
 
+    // Untuk grup: kalau nama belum diketahui, coba tanya langsung ke WA (groupMetadata) —
+    // ini query real-time yang sah (bukan pasif menunggu event), beda dari kontak perorangan
+    // yang memang tidak ada API resminya untuk "intip nama tersimpan di HP orang lain".
     if (isGrup && !dbConfig.kontak[jid] && globalSock) {
         try {
             const meta = await globalSock.groupMetadata(jid);
@@ -298,10 +339,12 @@ async function pastikanTopik(jid, pushName) {
 
     dbConfig.topik[jid] = result.message_thread_id;
 
+    // Pesan info topik yang di-pin, berisi nama/nomor + status online/typing (dari presence.update,
+    // yaitu info yang memang sudah dikirim WA ke akun ini secara protokol normal - bukan hasil manipulasi).
     if (!info.isGrup) {
         const displayNum = info.isLid ? 'Rahasia (LID)' : `+${info.nomor}`;
         const infoMsg = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID,
-            `ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor:${displayNum}\nStatus: 🔴 Offline`,
+            `ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor: ${displayNum}\nStatus: 🔴 Offline`,
             { message_thread_id: result.message_thread_id, parse_mode: 'Markdown' }));
         if (infoMsg) {
             dbConfig.topicInfoMsgs[jid] = infoMsg.message_id;
@@ -328,14 +371,13 @@ async function renameTopikJikaPerlu(jid, namaBaru, isGrup) {
 }
 
 // =========================================================================
-// STATUS COMMAND CENTER
+// STATUS COMMAND CENTER (TANPA toggle stealth)
 // =========================================================================
 async function perbaruiStatusTelegram(statusBaru, paksa = false) {
     if (!paksa && statusHpSaatIni === statusBaru && dbConfig.pinned_status_msg_id && antreanPesan.length === 0 && !sedangSinkronisasi) return;
     statusHpSaatIni = statusBaru;
 
-    const statusStealth = dbConfig.stealthMode ? '🟢 AKTIF (Hantu)' : '🔴 NONAKTIF';
-    let teksStatus = `🖥️ *COMMAND CENTER*\n\n📱 Koneksi WA: *${statusBaru}*\n🕶️ Mode Stealth: *${statusStealth}*\n📁 Batas Media: ${dbConfig.maxMediaMB} MB\n📦 Antrean: ${antreanPesan.length}`;
+    let teksStatus = `🖥️ *COMMAND CENTER*\n\n📱 Koneksi WA: *${statusBaru}*\n📁 Batas Media: ${dbConfig.maxMediaMB} MB\n📦 Antrean: ${antreanPesan.length}`;
     if (sedangSinkronisasi) teksStatus += `\n⏳ Sinkronisasi riwayat berjalan...`;
 
     try {
@@ -355,7 +397,7 @@ async function perbaruiStatusTelegram(statusBaru, paksa = false) {
 }
 
 // =========================================================================
-// COMMAND TELEGRAM & BALAS PESAN
+// COMMAND TELEGRAM
 // =========================================================================
 tgBot.on('message', async (msg) => {
     if (msg.chat.id.toString() !== TG_GROUP_ID || msg.from.is_bot) return;
@@ -366,25 +408,8 @@ tgBot.on('message', async (msg) => {
     const cmd = args[0].split('@')[0].toLowerCase();
 
     if (cmd === '/help') {
-        const help = `🛠️ *MENU COMMAND*\n/status - Diagnostik server\n/stealth [on/off] - Mode hantu (tanpa online & centang biru)\n/setmedia [MB] - Atur batas ukuran media\n/info - Detail kontak topik ini\n/mute /unmute - Bisukan/aktifkan topik ini\n/login [nomor] - Tautkan/ganti nomor WA\n/restart - Restart bot`;
+        const help = `🛠️ *MENU COMMAND*\n/status - Diagnostik server\n/setmedia [MB] - Atur batas ukuran media\n/info - Detail kontak topik ini\n/mute /unmute - Bisukan/aktifkan topik ini\n/login [nomor] - Tautkan/ganti nomor WA\n/restart - Restart bot\n\n💬 Ketik langsung di topik untuk kirim pesan baru. Pakai fitur *Reply* Telegram (bukan cuma ketik) untuk membalas pesan WA tertentu secara spesifik (quoted reply).\n✔️➡️✅➡️👀 Reaksi di pesan yang kamu kirim menunjukkan status: terkirim → sampai → dibaca.`;
         return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, help, { message_thread_id: threadId, parse_mode: 'Markdown' }));
-    }
-
-    if (cmd === '/stealth') {
-        const arg = (args[1] || '').toLowerCase();
-        if (arg === 'on') {
-            dbConfig.stealthMode = true;
-            if (globalSock) {
-                try { await globalSock.sendPresenceUpdate('unavailable'); } catch (e) {}
-            }
-        } else if (arg === 'off') {
-            dbConfig.stealthMode = false;
-        } else {
-            return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `⚠️ Format: \`/stealth on\` atau \`/stealth off\`\nStatus sekarang: *${dbConfig.stealthMode ? 'AKTIF' : 'NONAKTIF'}*`, { message_thread_id: threadId, parse_mode: 'Markdown' }));
-        }
-        await simpanKonfigurasiDB();
-        perbaruiStatusTelegram(statusHpSaatIni, true);
-        return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `✅ Mode Stealth berhasil diubah menjadi: *${dbConfig.stealthMode ? 'AKTIF' : 'NONAKTIF'}*`, { message_thread_id: threadId, parse_mode: 'Markdown' }));
     }
 
     if (cmd === '/setmedia') {
@@ -407,7 +432,7 @@ tgBot.on('message', async (msg) => {
 
     if (cmd === '/status') {
         const ram = (process.memoryUsage().rss / 1024 / 1024).toFixed(2);
-        return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📊 RAM: ${ram} MB\n🕶️ Stealth: ${dbConfig.stealthMode ? 'Aktif' : 'Nonaktif'}\n📁 Batas Media: ${dbConfig.maxMediaMB} MB\n🔌 WA: ${globalSock ? 'Terhubung' : 'Terputus'}\n📦 Antrean: ${antreanPesan.length}`, { message_thread_id: threadId }));
+        return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `📊 RAM: ${ram} MB\n📁 Batas Media: ${dbConfig.maxMediaMB} MB\n🔌 WA: ${globalSock ? 'Terhubung' : 'Terputus'}\n📦 Antrean: ${antreanPesan.length}`, { message_thread_id: threadId }));
     }
 
     if (cmd === '/mute' && targetJid) {
@@ -440,30 +465,25 @@ tgBot.on('message', async (msg) => {
 
     if (cmd === '/restart') {
         await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🔄 Merestart bot...`, { message_thread_id: threadId }));
+        // Tutup koneksi dengan rapi dulu sebelum keluar. Sebelumnya exit(1) langsung tanpa
+        // menutup socket WA/Mongo bisa meninggalkan koneksi menggantung, yang membuat
+        // startup BERIKUTNYA gagal connect (persis gejala "restart malah bikin crash").
         try { if (globalSock) globalSock.end(undefined); } catch (e) {}
         try { await mongoClient.close(); } catch (e) {}
-        await delay(1000);
+        await delay(1000); // beri waktu log & koneksi benar-benar tertutup
         process.exit(0);
     }
 
-    // ---- BALAS KE WA (DENGAN INDIKATOR TYPING & DUKUNGAN QUOTED REPLY) ----
+    // ---- BALAS KE WA (teks & media) DARI TELEGRAM ----
     if (targetJid && globalSock && !teks.startsWith('/')) {
-        try {
-            await globalSock.sendPresenceUpdate('composing', targetJid);
-            await delay(1200);
-            await globalSock.sendPresenceUpdate('paused', targetJid);
-        } catch (e) {}
+        // Indikator "sedang mengetik" ini JUJUR: memang sesaat sebelum bot benar-benar
+        // mengirim pesan, bukan sinyal palsu yang tidak merefleksikan aksi nyata.
+        await globalSock.sendPresenceUpdate('composing', targetJid);
+        await delay(1200);
+        await globalSock.sendPresenceUpdate('paused', targetJid);
 
         let msgOptions = { text: teks };
         const hasMedia = msg.photo || msg.video || msg.document || msg.audio || msg.voice;
-
-        let quotedMsgObj = undefined;
-        if (msg.reply_to_message) {
-            const waTargetMsg = tgToWaMap.get(msg.reply_to_message.message_id);
-            if (waTargetMsg) {
-                quotedMsgObj = waTargetMsg;
-            }
-        }
 
         try {
             if (hasMedia) {
@@ -484,13 +504,16 @@ tgBot.on('message', async (msg) => {
                 else if (msg.audio || msg.voice) msgOptions = { audio: buffer, mimetype: 'audio/mp4', ptt: !!msg.voice };
             }
 
-            const sendParams = quotedMsgObj ? { quoted: quotedMsgObj } : {};
-            const sent = await globalSock.sendMessage(targetJid, msgOptions, sendParams);
-            msgMapCache.set(sent.key.id, { tgMsgId: msg.message_id, threadId });
-
-            if (dbConfig.stealthMode) {
-                try { await globalSock.sendPresenceUpdate('unavailable'); } catch (e) {}
+            // Reply native Telegram -> jadi quoted-reply WA yang benar-benar menunjuk ke
+            // pesan WA aslinya, bukan sekadar pesan baru biasa.
+            let opsiKirim;
+            if (msg.reply_to_message) {
+                const target = cacheTgMsgToWa.get(msg.reply_to_message.message_id);
+                if (target && target.waJid === targetJid) opsiKirim = { quoted: target.waMsg };
             }
+
+            const sent = await globalSock.sendMessage(targetJid, msgOptions, opsiKirim);
+            msgMapCache.set(sent.key.id, { tgMsgId: msg.message_id, threadId });
         } catch (e) {
             console.error('[KIRIM WA ERROR]', e.message);
             await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal kirim: ${e.message}`, { message_thread_id: threadId }));
@@ -501,16 +524,16 @@ tgBot.on('message', async (msg) => {
 // =========================================================================
 // ANTREAN PENGIRIMAN KE TELEGRAM
 // =========================================================================
-async function masukAntrean(infoPesan, pushName = 'Kontak', isHistory = false) {
-    antreanPesan.push({ infoPesan, pushName, isHistory });
+async function masukAntrean(infoPesan, pushName = 'Kontak', isHistory = false, isFromMe = false) {
+    antreanPesan.push({ infoPesan, pushName, isHistory, isFromMe });
     if (!sedangMemprosesAntrean) jalankanPekerjaAntrean();
 }
 
 async function jalankanPekerjaAntrean() {
     sedangMemprosesAntrean = true;
     while (antreanPesan.length > 0) {
-        const { infoPesan, pushName, isHistory } = antreanPesan[0];
-        await eksekusiKirimKeTelegram(infoPesan, pushName, isHistory);
+        const { infoPesan, pushName, isHistory, isFromMe } = antreanPesan[0];
+        await eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe);
         antreanPesan.shift();
         if (antreanPesan.length % 10 === 0) perbaruiStatusTelegram(statusHpSaatIni);
         await delay(isHistory ? 1500 : 500);
@@ -520,7 +543,7 @@ async function jalankanPekerjaAntrean() {
     perbaruiStatusTelegram(statusHpSaatIni);
 }
 
-async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory) {
+async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe = false) {
     const idPengirim = infoPesan.key.remoteJid;
     if (dbConfig.muted.includes(idPengirim)) return;
 
@@ -529,34 +552,56 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory) {
     } catch (e) {
         return;
     }
-    const kirim = (fn) => kirimKeTopik({ jid: idPengirim }, fn);
+
+    // kirim() membungkus kirimKeTopik DAN mencatat pemetaan Telegram->WA untuk fitur
+    // reply native: pesan WA apa pun yang diteruskan ke Telegram bisa dijadikan target
+    // quoted-reply kalau kamu reply pesan itu di Telegram nanti.
+    const kirim = async (fn) => {
+        const hasil = await kirimKeTopik({ jid: idPengirim }, fn);
+        if (hasil?.message_id) {
+            cacheTgMsgToWa.set(hasil.message_id, { waJid: idPengirim, waMsg: { key: infoPesan.key, message: infoPesan.message } });
+        }
+        return hasil;
+    };
     const awalan = isHistory ? '🕰️ [Riwayat] ' : '';
 
+    // Bongkar wrapper WhatsApp: chat dengan "pesan sementara" (disappearing messages) aktif
+    // membungkus SEMUA pesan — termasuk pesan sekali-lihat — di dalam ephemeralMessage.
+    // Tanpa ini, tipePesan salah terbaca sebagai 'ephemeralMessage' dan semua deteksi di
+    // bawah (teks, media, view-once) gagal total untuk chat yang mengaktifkan fitur ini.
     let isiPesan = infoPesan.message;
     if (isiPesan.ephemeralMessage) isiPesan = isiPesan.ephemeralMessage.message;
     if (isiPesan.documentWithCaptionMessage) isiPesan = isiPesan.documentWithCaptionMessage.message;
     const tipePesan = Object.keys(isiPesan).find((k) => k !== 'senderKeyDistributionMessage' && k !== 'messageContextInfo');
     if (!tipePesan) return;
 
+    // Nama pengirim ASLI pesan ini — dipakai konsisten di SEMUA jenis pesan & notifikasi
+    // (termasuk hapus/edit/view-once) supaya selalu jelas siapa yang kirim:
+    // - isFromMe: selalu "Anda" (bug lama: sempat salah pakai nama lawan bicara utk pesan sendiri)
+    // - grup, bukan dari Anda: nama peserta pengirim (bukan nama grupnya)
+    // - pribadi, bukan dari Anda: ya kontak itu sendiri
     const infoUtama = ambilInfoKontak(idPengirim, pushName);
     const infoPengirimAsli = (infoUtama.isGrup && infoPesan.key.participant)
         ? ambilInfoKontak(infoPesan.key.participant, infoPesan.pushName)
         : infoUtama;
-    const namaPengirimGrup = infoUtama.isGrup ? `👤 *[${infoPengirimAsli.nama}]*:\n` : '';
+    const namaPengirimFinal = isFromMe ? 'Anda' : infoPengirimAsli.nama;
+    // Prefix arah yang tampil di body pesan: keluar (Anda) vs grup (nama peserta).
+    // Chat pribadi masuk tidak diberi prefix berulang karena topiknya sendiri sudah =kontak itu.
+    const prefixArah = isFromMe ? `📤 *Anda:*\n` : (infoUtama.isGrup ? `👤 *[${infoPengirimAsli.nama}]*:\n` : '');
 
-    // ---- REAKSI EMOJI ----
+    // ---- REAKSI EMOJI (netral, hanya melaporkan; TIDAK memaksa sinyal apa pun) ----
     if (isiPesan.reactionMessage) {
         const emoji = isiPesan.reactionMessage.text || '(dihapus)';
         const targetId = isiPesan.reactionMessage.key.id;
         const dataAsli = cacheAntiDelete.get(targetId);
-        await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${awalan}[Reaksi ${emoji}] pada: "_${dataAsli?.teks || 'pesan/media'}_"`, { message_thread_id: tId, parse_mode: 'Markdown' }));
+        await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${awalan}[Reaksi ${emoji} dari ${namaPengirimFinal}] pada: "_${dataAsli?.teks || 'pesan/media'}_"`, { message_thread_id: tId, parse_mode: 'Markdown' }));
         return;
     }
 
-    // ---- VIEW-ONCE ----
+    // ---- VIEW-ONCE: catat kehadirannya SAJA, jangan bongkar/simpan isinya ----
     const viewOnceKeys = ['viewOnceMessage', 'viewOnceMessageV2', 'viewOnceMessageV2Extension'];
     if (viewOnceKeys.includes(tipePesan)) {
-        const teksVO = `${awalan}👁️ *Pesan Sekali-Lihat*\n👤 Dari: ${infoPengirimAsli.nama}\nℹ️ Sesuai desain privasi WhatsApp, isi pesan ini tidak diteruskan atau disimpan oleh bot.`;
+        const teksVO = `${awalan}👁️ *Pesan Sekali-Lihat*\n👤 Dari: ${namaPengirimFinal}\nℹ️ Sesuai desain privasi WhatsApp, isi pesan ini tidak diteruskan atau disimpan oleh bot.`;
         await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, teksVO, { message_thread_id: tId, parse_mode: 'Markdown' }));
         return;
     }
@@ -564,8 +609,7 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory) {
     // ---- LOKASI ----
     if (isiPesan.locationMessage) {
         const loc = isiPesan.locationMessage;
-        const sLoc = await kirim((tId) => tgBot.sendLocation(TG_GROUP_ID, loc.degreesLatitude, loc.degreesLongitude, { message_thread_id: tId }));
-        if (sLoc) tgToWaMap.set(sLoc.message_id, infoPesan);
+        await kirim((tId) => tgBot.sendLocation(TG_GROUP_ID, loc.degreesLatitude, loc.degreesLongitude, { message_thread_id: tId }));
         if (loc.name) await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `📍 ${loc.name}`, { message_thread_id: tId }));
         return;
     }
@@ -574,16 +618,31 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory) {
         return;
     }
 
-    // ---- KONTAK ----
+    // ---- KONTAK (vCard) — sumber nama tambahan: kalau nomor di vCard ini sudah ------
+    // ---- punya topik di kita, perbarui namanya dengan nama dari vCard tersebut. ----
     if (isiPesan.contactMessage) {
-        const sC = await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${awalan}👤 Membagikan kontak: *${isiPesan.contactMessage.displayName}*`, { message_thread_id: tId, parse_mode: 'Markdown' }));
-        if (sC) tgToWaMap.set(sC.message_id, infoPesan);
+        const vc = parseVCard(isiPesan.contactMessage.vcard);
+        if (vc?.nama) {
+            for (const nomor of vc.nomorList) {
+                const kemungkinanJid = `${nomor}@s.whatsapp.net`;
+                if (dbConfig.topik[kemungkinanJid]) await renameTopikJikaPerlu(kemungkinanJid, vc.nama, false);
+            }
+        }
+        await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${awalan}${prefixArah}👤 Membagikan kontak: *${isiPesan.contactMessage.displayName}*`, { message_thread_id: tId, parse_mode: 'Markdown' }));
         return;
     }
     if (isiPesan.contactsArrayMessage) {
-        const jumlah = isiPesan.contactsArrayMessage.contacts?.length || 0;
-        const sC = await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${awalan}👥 Membagikan ${jumlah} kontak`, { message_thread_id: tId }));
-        if (sC) tgToWaMap.set(sC.message_id, infoPesan);
+        const daftarKontak = isiPesan.contactsArrayMessage.contacts || [];
+        for (const c of daftarKontak) {
+            const vc = parseVCard(c.vcard);
+            if (vc?.nama) {
+                for (const nomor of vc.nomorList) {
+                    const kemungkinanJid = `${nomor}@s.whatsapp.net`;
+                    if (dbConfig.topik[kemungkinanJid]) await renameTopikJikaPerlu(kemungkinanJid, vc.nama, false);
+                }
+            }
+        }
+        await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${awalan}${prefixArah}👥 Membagikan ${daftarKontak.length} kontak`, { message_thread_id: tId }));
         return;
     }
 
@@ -591,27 +650,26 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory) {
     if (isiPesan.pollCreationMessage || isiPesan.pollCreationMessageV3) {
         const poll = isiPesan.pollCreationMessage || isiPesan.pollCreationMessageV3;
         const daftarOpsi = (poll.options || []).map((o) => `• ${o.optionName}`).join('\n');
-        const sP = await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${awalan}📊 *Polling:* ${poll.name}\n${daftarOpsi}`, { message_thread_id: tId, parse_mode: 'Markdown' }));
-        if (sP) tgToWaMap.set(sP.message_id, infoPesan);
+        await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${awalan}${prefixArah}📊 *Polling:* ${poll.name}\n${daftarOpsi}`, { message_thread_id: tId, parse_mode: 'Markdown' }));
         return;
     }
 
-    // ---- STIKER ----
+    // ---- STIKER (Telegram tidak mendukung caption di sticker, jadi label arah dikirim terpisah) ----
     if (isiPesan.stickerMessage) {
         try {
+            if (prefixArah) await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, prefixArah.trim(), { message_thread_id: tId, parse_mode: 'Markdown' }));
             const stream = await downloadContentFromMessage(isiPesan.stickerMessage, 'sticker');
             let buffer = Buffer.alloc(0);
             for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
-            const sStk = await kirim((tId) => tgBot.sendSticker(TG_GROUP_ID, buffer, { message_thread_id: tId }));
-            if (sStk) tgToWaMap.set(sStk.message_id, infoPesan);
+            await kirim((tId) => tgBot.sendSticker(TG_GROUP_ID, buffer, { message_thread_id: tId }));
         } catch (e) { console.error('[STIKER ERROR]', e.message); }
         return;
     }
 
     const teksKonten = isiPesan.conversation || isiPesan.extendedTextMessage?.text || isiPesan[tipePesan]?.caption || '';
-    cacheAntiDelete.set(infoPesan.key.id, { teks: teksKonten, tipe: tipePesan, pengirim: infoPengirimAsli.nama, isGrup: infoUtama.isGrup });
+    cacheAntiDelete.set(infoPesan.key.id, { teks: teksKonten, tipe: tipePesan, pengirim: namaPengirimFinal, isGrup: infoUtama.isGrup });
 
-    // ---- QUOTE / REPLY INFO ----
+    // ---- QUOTE / REPLY ----
     const contextInfo = isiPesan.extendedTextMessage?.contextInfo || isiPesan.imageMessage?.contextInfo || isiPesan.videoMessage?.contextInfo || isiPesan.documentMessage?.contextInfo;
     let quoteBlock = '';
     const botJid = globalSock?.user?.id?.split(':')[0] + '@s.whatsapp.net';
@@ -625,13 +683,13 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory) {
     }
     const tagNotice = (contextInfo?.mentionedJid || []).includes(botJid) ? `🔔 *[ANDA DI-MENTION]*\n\n` : '';
 
-    // ---- MEDIA UMUM & TEKS ----
+    // ---- MEDIA UMUM ----
     const pesanMedia = isiPesan.imageMessage || isiPesan.videoMessage || isiPesan.documentMessage || isiPesan.audioMessage || isiPesan.ptvMessage;
     try {
         if (pesanMedia) {
             const ukuranBytes = parseInt(pesanMedia.fileLength || 0);
             if (ukuranBytes > dbConfig.maxMediaMB * 1024 * 1024) {
-                await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${awalan}⚠️ [Media Dilewati] Ukuran melebihi ${dbConfig.maxMediaMB} MB.`, { message_thread_id: tId }));
+                await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${awalan}${prefixArah}⚠️ [Media Dilewati] Ukuran melebihi ${dbConfig.maxMediaMB} MB.`, { message_thread_id: tId, parse_mode: 'Markdown' }));
                 return;
             }
             let tipeUnduh = '';
@@ -644,13 +702,11 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory) {
             let buffer = Buffer.alloc(0);
             for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
 
-            const sDoc = await kirim((tId) => tgBot.sendDocument(TG_GROUP_ID, buffer,
-                { message_thread_id: tId, caption: `${tagNotice}${awalan}${namaPengirimGrup}${quoteBlock}${teksKonten}`, parse_mode: 'Markdown' },
+            await kirim((tId) => tgBot.sendDocument(TG_GROUP_ID, buffer,
+                { message_thread_id: tId, caption: `${tagNotice}${awalan}${prefixArah}${quoteBlock}${teksKonten}`, parse_mode: 'Markdown' },
                 { filename: `media_${infoPesan.key.id}` }));
-            if (sDoc) tgToWaMap.set(sDoc.message_id, infoPesan);
         } else if (teksKonten.trim() !== '') {
-            const sMsg = await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}${awalan}${namaPengirimGrup}${quoteBlock}💬 ${teksKonten}`, { message_thread_id: tId, parse_mode: 'Markdown' }));
-            if (sMsg) tgToWaMap.set(sMsg.message_id, infoPesan);
+            await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}${awalan}${prefixArah}${quoteBlock}💬 ${teksKonten}`, { message_thread_id: tId, parse_mode: 'Markdown' }));
         }
     } catch (e) {
         console.error('[TG SEND ERROR]', e.message);
@@ -673,24 +729,13 @@ async function mulaiBotWhatsApp() {
             browser: Browsers.ubuntu('Chrome'),
             connectTimeoutMs: 60000,
             keepAliveIntervalMs: 20000,
-            syncFullHistory: false,
-            markOnlineOnConnect: false
+            syncFullHistory: false
+            // Sengaja TIDAK ada: markOnlineOnConnect:false + sendPresenceUpdate('unavailable') paksa,
+            // dan TIDAK ada patch sock.sendNode. Presence & status baca berjalan natural/default.
         });
-
-        const sendNodeAsli = sock.sendNode.bind(sock);
-        sock.sendNode = async (stanza) => {
-            if (dbConfig.stealthMode && stanza && stanza.tag === 'receipt') {
-                const attrs = stanza.attrs || {};
-                if (attrs.type === 'read' || attrs.type === 'read-self' || (attrs.to && attrs.to.includes('status@broadcast'))) {
-                    return;
-                }
-            }
-            return await sendNodeAsli(stanza);
-        };
-
         globalSock = sock;
 
-        // ---- SINKRONISASI KONTAK & GRUP ----
+        // ---- SINKRONISASI NAMA KONTAK & GRUP ASLI ----
         sock.ev.on('contacts.upsert', async (contacts) => {
             for (const c of contacts) {
                 const nama = c.name || c.notify;
@@ -710,7 +755,7 @@ async function mulaiBotWhatsApp() {
             for (const g of updates) if (g.subject && g.id) await renameTopikJikaPerlu(g.id, g.subject, true);
         });
 
-        // ---- LAZY HISTORY SYNC ----
+        // ---- LAZY HISTORY SYNC (termasuk ekstraksi nama kontak dari riwayat) ----
         let bufferRiwayat = [];
         sock.ev.on('messaging-history.set', async ({ messages, contacts }) => {
             if (contacts) {
@@ -751,7 +796,10 @@ async function mulaiBotWhatsApp() {
             })();
         }, HISTORY_SYNC_DELAY_MS);
 
-        // ---- STATUS ONLINE/TYPING KONTAK ----
+        // ---- STATUS ONLINE/TYPING KONTAK (REALTIME, PER-TOPIK): mencerminkan info yg
+        // memang dikirim WA ke akun ini secara protokol normal, ditampilkan di pesan info
+        // topik yang di-pin. Saat offline, ditambahkan "terakhir terlihat" (last seen) —
+        // juga fitur bawaan WA, bukan data tambahan hasil pelacakan di luar protokol.
         sock.ev.on('presence.update', async (presence) => {
             const jid = presence.id;
             const state = presence.presences[Object.keys(presence.presences)[0]]?.lastKnownPresence;
@@ -760,12 +808,25 @@ async function mulaiBotWhatsApp() {
 
             const info = ambilInfoKontak(jid, null);
             let icon = '🔴 Offline';
-            if (state === 'available') icon = '🟢 Online';
-            else if (state === 'composing') icon = '✍ Mengetik...';
-            else if (state === 'recording') icon = '🎤 Merekam suara...';
+            let baris = `ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor: +${info.nomor}\nStatus: `;
 
-            safeTG(() => tgBot.editMessageText(`ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor: +${info.nomor}\nStatus: ${icon}`,
-                { chat_id: TG_GROUP_ID, message_id: msgId, parse_mode: 'Markdown' }));
+            if (state === 'available') {
+                icon = '🟢 Online';
+                lastSeenMap[jid] = null; // sedang online, tidak ada "terakhir terlihat" utk ditampilkan
+            } else if (state === 'composing') {
+                icon = '✍️ Mengetik...';
+            } else if (state === 'recording') {
+                icon = '🎤 Merekam suara...';
+            } else {
+                lastSeenMap[jid] = Date.now();
+            }
+
+            baris += icon;
+            if (icon === '🔴 Offline' && lastSeenMap[jid]) {
+                baris += `\n🕒 Terakhir terlihat: ${new Date(lastSeenMap[jid]).toLocaleString('id-ID')}`;
+            }
+
+            safeTG(() => tgBot.editMessageText(baris, { chat_id: TG_GROUP_ID, message_id: msgId, parse_mode: 'Markdown' }));
         });
 
         // ---- PAIRING ----
@@ -808,9 +869,6 @@ async function mulaiBotWhatsApp() {
                 setTimeout(mulaiBotWhatsApp, 5000);
             } else if (connection === 'open') {
                 sedangMenungguPairing = false;
-                if (dbConfig.stealthMode) {
-                    try { await sock.sendPresenceUpdate('unavailable'); } catch (e) {}
-                }
                 perbaruiStatusTelegram('Online');
                 if (!sock.authState.creds.registered) {
                     safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `⚠️ Terhubung tapi belum login. Kirim \`/login 628xxx\`.`, { parse_mode: 'Markdown' }));
@@ -841,9 +899,10 @@ async function mulaiBotWhatsApp() {
             } catch (e) { console.error('[GROUP EVENT ERROR]', e.message); }
         });
 
-        // ---- CENTANG PESAN & VIEWER STATUS ----
+        // ---- STATUS/CENTANG PESAN YANG DIKIRIM BOT + VIEWER STATUS SENDIRI ----
         sock.ev.on('messages.update', async (updates) => {
             for (const update of updates) {
+                // Siapa yang melihat status WA milik akun ini (fitur bawaan WA - viewer list status sendiri)
                 if (update.key.remoteJid === 'status@broadcast' && update.update.status === 4) {
                     const info = ambilInfoKontak(update.key.participant, null);
                     const statMem = statusMemory.get(update.key.id);
@@ -852,26 +911,23 @@ async function mulaiBotWhatsApp() {
                     continue;
                 }
 
+                // Status centang untuk pesan yang DIKIRIM BOT dari Telegram (bukan manipulasi -
+                // ini status asli pesan yg memang dikirim, ditampilkan via reaksi di pesan Telegram):
+                // ✔️ abu-abu = terkirim ke server, ✅ hijau = sampai di HP, 👀 = sudah dibaca.
                 if (update.update.status) {
                     const tgData = msgMapCache.get(update.key.id);
                     if (tgData) {
-                        try {
-                            if (update.update.status === 3) {
-                                await fetch(`https://api.telegram.org/bot${TG_TOKEN}/setMessageReaction`, {
-                                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ chat_id: TG_GROUP_ID, message_id: tgData.tgMsgId, reaction: [{ type: 'emoji', emoji: '✅' }] })
-                                });
-                            } else if (update.update.status === 4) {
-                                await fetch(`https://api.telegram.org/bot${TG_TOKEN}/setMessageReaction`, {
-                                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ chat_id: TG_GROUP_ID, message_id: tgData.tgMsgId, reaction: [{ type: 'emoji', emoji: '👀' }] })
-                                });
-                                msgMapCache.del(update.key.id);
-                            }
-                        } catch (e) {}
+                        const st = update.update.status;
+                        if (st === 2) await setTGReaksi(tgData.tgMsgId, '✔️');
+                        else if (st === 3) await setTGReaksi(tgData.tgMsgId, '✅');
+                        else if (st === 4) {
+                            await setTGReaksi(tgData.tgMsgId, '👀');
+                            msgMapCache.del(update.key.id);
+                        }
                     }
                 }
 
+                // Anti-delete / anti-edit (jalur #1: lewat messages.update)
                 if (update.update.protocolMessage) {
                     await prosesProtokolPesan(update.update.protocolMessage, update.key.participant);
                 }
@@ -890,6 +946,9 @@ async function mulaiBotWhatsApp() {
             const pushName = infoPesan.pushName || 'Kontak';
             const jid = infoPesan.key.remoteJid;
 
+            // Anti-delete / anti-edit (jalur #2: kadang datang sebagai pesan baru via messages.upsert,
+            // bukan messages.update — tergantung pelakunya diri sendiri atau orang lain, dan versi WA).
+            // Cek langsung DAN cek di dalam editedMessage (dua bentuk yang sama-sama dipakai Baileys).
             const protoLangsung = infoPesan.message.protocolMessage;
             const protoDalamEdit = infoPesan.message.editedMessage?.message?.protocolMessage;
             if (protoLangsung || protoDalamEdit) {
@@ -897,7 +956,7 @@ async function mulaiBotWhatsApp() {
                 return;
             }
 
-            // Status WA (Story)
+            // Status WA (story) - punya orang lain ATAU status sendiri yg baru diunggah
             if (jid === 'status@broadcast') {
                 let statusMsg = infoPesan.message;
                 if (statusMsg.ephemeralMessage) statusMsg = statusMsg.ephemeralMessage.message;
@@ -939,8 +998,11 @@ async function mulaiBotWhatsApp() {
             }
 
             if (infoPesan.key.fromMe) {
+                // Backup dua arah: pesan yg kamu kirim sendiri dari HP juga ikut tersalin,
+                // KECUALI yang memang baru saja dikirim BOT ini sendiri (hindari duplikat).
+                // isFromMe=true supaya ditandai "📤 Anda" dengan benar (bukan nama lawan bicara).
                 if (!msgMapCache.has(infoPesan.key.id)) {
-                    masukAntrean(infoPesan, pushName, false);
+                    masukAntrean(infoPesan, pushName, false, true);
                 }
                 return;
             }
@@ -958,7 +1020,7 @@ async function mulaiBotWhatsApp() {
 }
 
 // =========================================================================
-// EXPRESS SERVER & HEARTBEAT
+// EXPRESS SERVER, HEARTBEAT, GARBAGE COLLECTOR
 // =========================================================================
 setInterval(() => { if (global.gc) global.gc(); }, 120000);
 
@@ -1008,7 +1070,7 @@ async function inisialisasiDenganRetry(percobaan = 1) {
             return inisialisasiDenganRetry(percobaan + 1);
         }
         console.error('[STARTUP ERROR] Menyerah setelah 5 percobaan. Keluar.');
-        await new Promise((r) => setTimeout(r, 1500));
+        await new Promise((r) => setTimeout(r, 1500)); // beri waktu log ter-flush sebelum exit
         process.exit(1);
     }
 }
