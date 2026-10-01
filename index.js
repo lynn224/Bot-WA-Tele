@@ -226,7 +226,7 @@ function ambilInfoKontak(jid, pushNameFallback) {
 }
 
 // =========================================================================
-// PROTOKOL PESAN (HAPUS & EDIT) - SINTAKS DIPERBAIKI PENUH
+// PROTOKOL PESAN (HAPUS & EDIT)
 // =========================================================================
 async function prosesProtokolPesan(protoMsg, jidPelaku) {
     if (!protoMsg?.key?.id) return;
@@ -327,7 +327,7 @@ async function renameTopikJikaPerlu(jid, namaBaru, isGrup) {
 }
 
 // =========================================================================
-// STATUS COMMAND CENTER (DENGAN INDIKATOR STEALTH)
+// STATUS COMMAND CENTER
 // =========================================================================
 async function perbaruiStatusTelegram(statusBaru, paksa = false) {
     if (!paksa && statusHpSaatIni === statusBaru && dbConfig.pinned_status_msg_id && antreanPesan.length === 0 && !sedangSinkronisasi) return;
@@ -447,7 +447,6 @@ tgBot.on('message', async (msg) => {
 
     // ---- BALAS KE WA (DENGAN INDIKATOR TYPING & DUKUNGAN QUOTED REPLY) ----
     if (targetJid && globalSock && !teks.startsWith('/')) {
-        // Indikator sedang mengetik (natural typing indicator)
         try {
             await globalSock.sendPresenceUpdate('composing', targetJid);
             await delay(1200);
@@ -457,7 +456,6 @@ tgBot.on('message', async (msg) => {
         let msgOptions = { text: teks };
         const hasMedia = msg.photo || msg.video || msg.document || msg.audio || msg.voice;
 
-        // Fitur Reply Pesan Spesifik: Cek apakah user mereply pesan di Telegram
         let quotedMsgObj = undefined;
         if (msg.reply_to_message) {
             const waTargetMsg = tgToWaMap.get(msg.reply_to_message.message_id);
@@ -489,7 +487,6 @@ tgBot.on('message', async (msg) => {
             const sent = await globalSock.sendMessage(targetJid, msgOptions, sendParams);
             msgMapCache.set(sent.key.id, { tgMsgId: msg.message_id, threadId });
 
-            // Setelah mengirim pesan, kembalikan presence ke 'unavailable' jika stealth aktif
             if (dbConfig.stealthMode) {
                 try { await globalSock.sendPresenceUpdate('unavailable'); } catch (e) {}
             }
@@ -676,10 +673,9 @@ async function mulaiBotWhatsApp() {
             connectTimeoutMs: 60000,
             keepAliveIntervalMs: 20000,
             syncFullHistory: false,
-            markOnlineOnConnect: false // Stealth: tidak auto-online saat startup
+            markOnlineOnConnect: false
         });
 
-        // Intersepsi tanda terima baca / centang biru & viewer status
         const sendNodeAsli = sock.sendNode.bind(sock);
         sock.sendNode = async (stanza) => {
             if (dbConfig.stealthMode && stanza && stanza.tag === 'receipt') {
@@ -764,7 +760,7 @@ async function mulaiBotWhatsApp() {
             const info = ambilInfoKontak(jid, null);
             let icon = '🔴 Offline';
             if (state === 'available') icon = '🟢 Online';
-            else if (state === 'composing') icon = '✍️️ Mengetik...';
+            else if (state === 'composing') icon = '✍ Mengetik...';
             else if (state === 'recording') icon = '🎤 Merekam suara...';
 
             safeTG(() => tgBot.editMessageText(`ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor: +${info.nomor}\nStatus: ${icon}`,
