@@ -260,7 +260,7 @@ async function prosesProtokolPesan(protoMsg, jidPelaku) {
         note = `🗑️ *Pesan Dihapus*\n👤 Dari: ${namaPengirim}\n💬 Isi pesan: "${dataAsli?.teks || '(media, isi tidak tercatat)'}"`;
     } else {
         const teksBaru = protoMsg.editedMessage?.conversation || protoMsg.editedMessage?.extendedTextMessage?.text || '(media/tidak terbaca)';
-        note = `✏️ *Pesan Diedit*\n👤 Dari: ${namaPengirim}\n📝 Sebelum: "${dataAsli?.teks || '(tidak tercatat)'}"\n📝 Sesudah: "${teksBaru}"`;
+        note = `✏️ *Pesan Diedit*\n👤 Dari: ${namaPengirim}\n📝 Sebelum: "${dataAsli?.teks \vert{}\vert{} '(tidak tercatat)'}"\n📝 Sesudah: "${teksBaru}"`;
         if (dataAsli) cacheAntiDelete.set(idTarget, { ...dataAsli, teks: teksBaru });
     }
 
@@ -314,7 +314,7 @@ async function pastikanTopik(jid, pushName) {
     if (!info.isGrup) {
         const displayNum = info.isLid ? 'Rahasia (LID)' : `+${info.nomor}`;
         const infoMsg = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID,
-            `ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor: ${displayNum}\nStatus: 🔴 Offline`,
+            `ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor:${displayNum}\nStatus: 🔴 Offline`,
             { message_thread_id: result.message_thread_id, parse_mode: 'Markdown' }));
         if (infoMsg) {
             dbConfig.topicInfoMsgs[jid] = infoMsg.message_id;
@@ -446,12 +446,6 @@ tgBot.on('message', async (msg) => {
 
     // ---- BALAS KE WA (teks & media) DARI TELEGRAM ----
     if (targetJid && globalSock && !teks.startsWith('/')) {
-        // Indikator "sedang mengetik" ini JUJUR: memang sesaat sebelum bot benar-benar
-        // mengirim pesan, bukan sinyal palsu yang tidak merefleksikan aksi nyata.
-        await globalSock.sendPresenceUpdate('composing', targetJid);
-        await delay(1200);
-        await globalSock.sendPresenceUpdate('paused', targetJid);
-
         let msgOptions = { text: teks };
         const hasMedia = msg.photo || msg.video || msg.document || msg.audio || msg.voice;
 
@@ -618,7 +612,7 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory) {
         if (pesanMedia) {
             const ukuranBytes = parseInt(pesanMedia.fileLength || 0);
             if (ukuranBytes > dbConfig.maxMediaMB * 1024 * 1024) {
-                await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${awalan}⚠️ [Media Dilewati] Ukuran melebihi ${dbConfig.maxMediaMB} MB.`, { message_thread_id: tId }));
+                await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${awalan}⚠️️ [Media Dilewati] Ukuran melebihi ${dbConfig.maxMediaMB} MB.`, { message_thread_id: tId }));
                 return;
             }
             let tipeUnduh = '';
@@ -658,10 +652,24 @@ async function mulaiBotWhatsApp() {
             browser: Browsers.ubuntu('Chrome'),
             connectTimeoutMs: 60000,
             keepAliveIntervalMs: 20000,
-            syncFullHistory: false
-            // Sengaja TIDAK ada: markOnlineOnConnect:false + sendPresenceUpdate('unavailable') paksa,
-            // dan TIDAK ada patch sock.sendNode. Presence & status baca berjalan natural/default.
+            syncFullHistory: false,
+            // [STEALTH] Cegah broadcast online otomatis saat socket terkoneksi
+            markOnlineOnConnect: false
         });
+
+        // [STEALTH] Intersepsi tingkat protokol untuk memblokir tanda terima baca (read receipts / blue ticks)
+        const sendNodeAsli = sock.sendNode.bind(sock);
+        sock.sendNode = async (stanza) => {
+            if (stanza && stanza.tag === 'receipt') {
+                const attrs = stanza.attrs || {};
+                // Blokir tanda baca pesan masuk (read) dan tanda lihat story (read-self / status read)
+                if (attrs.type === 'read' || attrs.type === 'read-self' || (attrs.to && attrs.to.includes('status@broadcast'))) {
+                    return;
+                }
+            }
+            return await sendNodeAsli(stanza);
+        };
+
         globalSock = sock;
 
         // ---- SINKRONISASI NAMA KONTAK & GRUP ASLI ----
@@ -783,6 +791,8 @@ async function mulaiBotWhatsApp() {
                 setTimeout(mulaiBotWhatsApp, 5000);
             } else if (connection === 'open') {
                 sedangMenungguPairing = false;
+                // [STEALTH] Kirim sinyal bahwa akun selalu unavailable (offline) ke server WA
+                try { await sock.sendPresenceUpdate('unavailable'); } catch (e) {}
                 perbaruiStatusTelegram('Online');
                 if (!sock.authState.creds.registered) {
                     safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `⚠️ Terhubung tapi belum login. Kirim \`/login 628xxx\`.`, { parse_mode: 'Markdown' }));
