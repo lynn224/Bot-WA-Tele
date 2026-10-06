@@ -7,8 +7,7 @@
     "start": "node --expose-gc index.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "latest",
-     "baileys-caller": "latest",
+    "@whiskeysockets/baileys": "latest", 
     "node-telegram-bot-api": "0.66.0",
     "express": "4.21.0",
     "pino": "9.4.0",
