@@ -11,10 +11,6 @@ const {
     Browsers
 } = require('@whiskeysockets/baileys');
 
-// Modul baileys-caller untuk penanganan panggilan
-const BaileysCallerModule = require('baileys-caller');
-const BaileysCaller = BaileysCallerModule.Caller || BaileysCallerModule.default || BaileysCallerModule;
-
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const pino = require('pino');
@@ -111,7 +107,7 @@ let dbConfig = {
     kataKunci: [], 
     blacklistKataKunci: [], 
     blacklistStatus: [],
-    stealthMode: true // Mode Stealth aktif default
+    stealthMode: true
 };
 
 const currentStatusMap = {};
@@ -326,7 +322,7 @@ async function prosesProtokolPesan(protoMsg, jidPelaku) {
         note = `🗑️ *Pesan Dihapus*\n👤 Dari: ${namaPengirim}\n💬 Isi pesan: "${dataAsli?.teks || '(media, isi tidak tercatat)'}"${linkAsli}`;
     } else {
         const teksBaru = protoMsg.editedMessage?.conversation || protoMsg.editedMessage?.extendedTextMessage?.text || '(media/tidak terbaca)';
-        note = `✏️️ *Pesan Diedit*\n👤 Dari: ${namaPengirim}\n📝 Sebelum: "${dataAsli?.teks || '(tidak tercatat)'}"\n📝 Sesudah: "${teksBaru}"${linkAsli}`;
+        note = `✏️ *Pesan Diedit*\n👤 Dari: ${namaPengirim}\n📝 Sebelum: "${dataAsli?.teks || '(tidak tercatat)'}"\n📝 Sesudah: "${teksBaru}"${linkAsli}`;
         if (dataAsli) cacheAntiDelete.set(idTarget, { ...dataAsli, teks: teksBaru });
     }
 
@@ -1221,7 +1217,6 @@ async function mulaiBotWhatsApp() {
                 setTimeout(mulaiBotWhatsApp, 5000);
             } else if (connection === 'open') {
                 sedangMenungguPairing = false;
-                // Dorong status offline jika stealth mode dihidupkan
                 if (dbConfig.stealthMode) {
                     try { await sock.sendPresenceUpdate('unavailable'); } catch (e) {}
                 }
@@ -1234,7 +1229,7 @@ async function mulaiBotWhatsApp() {
 
         sock.ev.on('creds.update', saveCreds);
 
-        // ---- PANGGILAN MASUK VIA BAILEYS-CALLER ----
+        // ---- PANGGILAN MASUK (MENGGUNAKAN EVENT BAWAAN BAILEYS) ----
         const callStateMap = {};
         const kirimLogPanggilan = async (callFromJid, teks) => {
             await kirimKeTopik({ sysKey: 'audit' }, (tId) => tgBot.sendMessage(TG_GROUP_ID, teks, { message_thread_id: tId, parse_mode: 'Markdown' }));
@@ -1244,11 +1239,8 @@ async function mulaiBotWhatsApp() {
             } catch (e) { }
         };
 
-        const caller = new BaileysCaller(sock);
-        caller.on('call', async (call) => {
-            const callsArray = Array.isArray(call) ? call : [call];
-            
-            for (const c of callsArray) {
+        sock.ev.on('call', async (calls) => {
+            for (const c of calls) {
                 console.log('[CALL EVENT RAW]', JSON.stringify(c));
 
                 const callId = c.id;
@@ -1335,7 +1327,7 @@ async function mulaiBotWhatsApp() {
                     const tgData = msgMapCache.get(update.key.id);
                     if (tgData) {
                         const st = update.update.status;
-                        if (st === 2) await setTGReaksi(tgData.tgMsgId, '✔️️');
+                        if (st === 2) await setTGReaksi(tgData.tgMsgId, '✔️');
                         else if (st === 3) await setTGReaksi(tgData.tgMsgId, '✅');
                         else if (st === 4) {
                             await setTGReaksi(tgData.tgMsgId, '👀');
