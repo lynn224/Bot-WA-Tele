@@ -61,6 +61,15 @@ const msgMapCache = new NodeCache({ stdTTL: 86400 });
 const cacheTgMsgToWaMemori = new NodeCache({ stdTTL: 3 * 86400 });
 const cacheWaMsgToTg = new NodeCache({ stdTTL: 3 * 86400 });
 
+// [ANTI-MACET] Timeout untuk mencegah antrean pesan menggantung
+const withTimeout = (promise, ms, name) => {
+    let timeoutId;
+    const timeoutPromise = new Promise((_, reject) => {
+        timeoutId = setTimeout(() => reject(new Error(`Timeout at ${name}`)), ms);
+    });
+    return Promise.race([promise, timeoutPromise]).finally(() => clearTimeout(timeoutId));
+};
+
 async function simpanPemetaanReply(tgMsgId, data) {
     cacheTgMsgToWaMemori.set(tgMsgId, data);
     try {
@@ -106,7 +115,7 @@ let dbConfig = {
     kataKunci: [], 
     blacklistKataKunci: [], 
     blacklistStatus: [],
-    stealthMode: true 
+    stealthMode: true // Mode Hantu otomatis hidup di awal
 };
 
 const currentStatusMap = {};
@@ -125,7 +134,29 @@ async function safeTG(apiCall) {
         } catch (e) {
             if (e.message && e.message.includes('429')) {
                 const wait = parseInt(e.message.match(/retry after (\d+)/)?.[1] || '30', 10);
-                console.log(`[TG RATE LIMIT] Menunggu ${wait + 1} detik...`);                 await delay((wait + 1) * 1000);             } else {                 console.error('[TG ERROR]', e.message);                 return null;             }         }     }     return null; }  function parseVCard(vcardText) {     if (!vcardText) return null;     const namaMatch = vcardText.match(/FN:(.+)/);     const nama = namaMatch ? namaMatch[1].trim() : null;     const nomorList = [...vcardText.matchAll(/TEL[^:]*:([+()\d\s-]+)/g)].map((m) => m[1].replace(/[^\d]/g, '')).filter(Boolean);     if (!nama && nomorList.length === 0) return null;     return { nama, nomorList }; }  async function setTGReaksi(msgId, emoji) {     try {         await fetch(`https://api.telegram.org/bot${TG_TOKEN}/setMessageReaction`, {
+                console.log(`[TG RATE LIMIT] Menunggu ${wait + 1} detik...`);
+                await delay((wait + 1) * 1000);
+            } else {
+                console.error('[TG ERROR]', e.message);
+                return null;
+            }
+        }
+    }
+    return null;
+}
+
+function parseVCard(vcardText) {
+    if (!vcardText) return null;
+    const namaMatch = vcardText.match(/FN:(.+)/);
+    const nama = namaMatch ? namaMatch[1].trim() : null;
+    const nomorList = [...vcardText.matchAll(/TEL[^:]*:([+()\d\s-]+)/g)].map((m) => m[1].replace(/[^\d]/g, '')).filter(Boolean);
+    if (!nama && nomorList.length === 0) return null;
+    return { nama, nomorList };
+}
+
+async function setTGReaksi(msgId, emoji) {
+    try {
+        await fetch(`https://api.telegram.org/bot${TG_TOKEN}/setMessageReaction`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ chat_id: TG_GROUP_ID, message_id: msgId, reaction: [{ type: 'emoji', emoji }] })
@@ -337,7 +368,27 @@ async function pastikanTopik(jid, pushName) {
             const meta = await globalSock.groupMetadata(jid);
             if (meta?.subject) dbConfig.kontak[jid] = meta.subject;
         } catch (e) {
-            console.log(`[GROUP METADATA] Gagal ambil nama grup ${jid}:`, e.message);         }     }      const info = ambilInfoKontak(jid, pushName);          // PERBAIKAN UI: Kontak LID tidak akan dicetak nomor acaknya di judul Folder     let namaFolder = info.isGrup ? '👥 GRUP: ' + info.nama : '👤 ' + info.nama;     if (!info.isLid && !info.isGrup) {         namaFolder += ' (' + info.nomor + ')';     }     namaFolder = namaFolder.substring(0, 127);      const result = await safeTG(() => tgBot.createForumTopic(TG_GROUP_ID, namaFolder));     if (!result) throw new Error('Gagal membuat topik setelah retry');      dbConfig.topik[jid] = result.message_thread_id;      if (!info.isGrup) {         // Tampilan khusus agar info nomor tersembunyi terlihat rapi         const displayNum = info.isLid ? 'Nomor Disembunyikan (LID)' : `+${info.nomor}`;
+            console.log(`[GROUP METADATA] Gagal ambil nama grup ${jid}:`, e.message);
+        }
+    }
+
+    const info = ambilInfoKontak(jid, pushName);
+    
+    // PERBAIKAN UI: Kontak LID tidak akan dicetak nomor acaknya di judul Folder
+    let namaFolder = info.isGrup ? '👥 GRUP: ' + info.nama : '👤 ' + info.nama;
+    if (!info.isLid && !info.isGrup) {
+        namaFolder += ' (' + info.nomor + ')';
+    }
+    namaFolder = namaFolder.substring(0, 127);
+
+    const result = await safeTG(() => tgBot.createForumTopic(TG_GROUP_ID, namaFolder));
+    if (!result) throw new Error('Gagal membuat topik setelah retry');
+
+    dbConfig.topik[jid] = result.message_thread_id;
+
+    if (!info.isGrup) {
+        // Tampilan khusus agar info nomor tersembunyi terlihat rapi
+        const displayNum = info.isLid ? 'Nomor Disembunyikan (LID)' : `+${info.nomor}`;
         const infoMsg = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID,
             `ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor:${displayNum}\nStatus: 🔴 Offline`,
             { message_thread_id: result.message_thread_id, parse_mode: 'Markdown' }));
@@ -430,7 +481,7 @@ tgBot.on('message', async (msg) => {
     };
 
     if (cmd === '/help') {
-        const help = `🛠️ *MENU COMMAND*\n\n*Umum* (jalankan di topik 📌 Perintah Bot):\n/status - Diagnostik server\n/stealth [on/off] - Mode hantu (tanpa online & centang biru)\n/setmedia [MB] - Atur batas ukuran media\n/online - Status online semua kontak tersimpan\n/restart - Restart bot\n/login [nomor] - Tautkan/ganti nomor WA\n\n*Kata Kunci* (notifikasi di topik 🔔 Kata Kunci):\n/addkata kata1,kata2 - Tambah kata kunci\n/listkata - Lihat daftar kata kunci\n/delkata [nomor] - Hapus kata kunci\n/blacklistkata - Blacklist kontak ini dari notif kata kunci\n/unblacklistkata - Cabut blacklist kata kunci\n/listblacklistkata - Lihat daftar blacklist kata kunci\n\n*Status WA*:\n/nostatus - Jangan unduh status kontak ini (jalankan di topiknya)\n/yesstatus - Cabut, unduh lagi\n/liststatus - Lihat daftar blacklist status\n\n*Khusus topik kontak/grup*:\n/info - Detail lengkap kontak (foto, bio, status online)\n/mute /unmute - Bisukan/aktifkan topik ini\n/hapustopik - Hapus topik ini + data terkaitnya\n\n*Lainnya*:\n/hapussemuatopik konfirmasi - Hapus SEMUA topik kontak/grup (data penting tetap aman)\n\n💬 Ketik langsung di topik untuk kirim pesan baru. Pakai fitur *Reply* Telegram untuk membalas pesan WA tertentu.\n👍➡️👌➡️👀 Reaksi di pesan yang kamu kirim menunjukkan status: terkirim → diterima → dibaca.\n\n⏱️ Perintah & balasan otomatis terhapus dlm 5 menit (Pastikan bot adalah Admin agar fitur hapus berjalan).`;
+        const help = `🛠️ *MENU COMMAND*\n\n*Umum* (jalankan di topik 📌 Perintah Bot):\n/status - Diagnostik server\n/stealth [on/off] - Mode hantu (tanpa online & centang biru)\n/setmedia [MB] - Atur batas ukuran media\n/online - Status online semua kontak tersimpan\n/restart - Restart bot\n/login [nomor] - Tautkan/ganti nomor WA\n\n*Kata Kunci* (notifikasi di topik 🔔 Kata Kunci):\n/addkata kata1,kata2 - Tambah kata kunci\n/listkata - Lihat daftar kata kunci\n/delkata [nomor] - Hapus kata kunci\n/blacklistkata - Blacklist kontak ini dari notif kata kunci\n/unblacklistkata - Cabut blacklist kata kunci\n/listblacklistkata - Lihat daftar blacklist kata kunci\n\n*Status WA*:\n/nostatus - Jangan unduh status kontak ini (jalankan di topiknya)\n/yesstatus - Cabut, unduh lagi\n/liststatus - Lihat daftar blacklist status\n\n*Khusus topik kontak/grup*:\n/info - Detail lengkap kontak (foto, bio, status online)\n/mute /unmute - Bisukan/aktifkan topik ini\n/hapustopik - Hapus topik ini + data terkaitnya\n\n*Lainnya*:\n/hapussemuatopik konfirmasi - Hapus SEMUA topik kontak/grup (data penting tetap aman)\n\n💬 Ketik langsung di topik untuk kirim pesan baru. Pakai fitur *Reply* Telegram untuk membalas pesan WA tertentu.\n⚡➡️🤝➡️👀 Reaksi di pesan yang kamu kirim menunjukkan status: terkirim → sampai → dibaca.\n\n⏱️ Perintah & balasan otomatis terhapus dlm 5 menit (Pastikan bot adalah Admin agar fitur hapus berjalan).`;
         return balasPerintah(help, { parse_mode: 'Markdown' });
     }
 
@@ -466,11 +517,28 @@ tgBot.on('message', async (msg) => {
         const ketLid = info.isLid ? '\n_(Komunitas/Saluran WA — nomor asli disembunyikan WhatsApp)_' : '';
         const statusOnline = currentStatusMap[targetJid] || '❔ Belum diketahui';
         const terakhirTerlihat = (statusOnline === '🔴 Offline' && lastSeenMap[targetJid])
-            ? `\n🕒 Terakhir terlihat: ${waktuLokal(new Date(lastSeenMap[targetJid]))}` : '';          let bio = '';         if (!info.isGrup && globalSock) {             try {                 const st = await globalSock.fetchStatus(targetJid);                 if (st?.status) bio = `\n📝 Bio: ${st.status}`;
+            ? `\n🕒 Terakhir terlihat: ${waktuLokal(new Date(lastSeenMap[targetJid]))}` : '';
+
+        let bio = '';
+        if (!info.isGrup && globalSock) {
+            try {
+                const st = await globalSock.fetchStatus(targetJid);
+                if (st?.status) bio = `\n📝 Bio: ${st.status}`;
             } catch (e) { }
         }
 
-        const teksInfo = `ℹ️ *DETAIL KONTAK*\n\n👤 Nama: ${info.nama}\n📞 Nomor: \`${info.isLid ? 'LID' : '+' + info.nomor}\`\n💬 Tipe: ${info.isGrup ? 'Grup' : 'Pribadi'}\n🟢 Status: ${statusOnline}${terakhirTerlihat}${bio}\n🆔 JID: \`${targetJid}\`${ketLid}`;          let fotoUrl = null;         if (globalSock) {             try { fotoUrl = await globalSock.profilePictureUrl(targetJid, 'image'); } catch (e) { }         }          let hasil;         if (fotoUrl) {             hasil = await safeTG(() => tgBot.sendPhoto(TG_GROUP_ID, fotoUrl, { caption: teksInfo, message_thread_id: threadId, parse_mode: 'Markdown' }));         } else {             hasil = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${teksInfo}\n\n_(Tidak ada foto profil / diprivasi)_`, { message_thread_id: threadId, parse_mode: 'Markdown' }));
+        const teksInfo = `ℹ️ *DETAIL KONTAK*\n\n👤 Nama: ${info.nama}\n📞 Nomor: \`${info.isLid ? 'LID' : '+' + info.nomor}\`\n💬 Tipe: ${info.isGrup ? 'Grup' : 'Pribadi'}\n🟢 Status: ${statusOnline}${terakhirTerlihat}${bio}\n🆔 JID: \`${targetJid}\`${ketLid}`;
+
+        let fotoUrl = null;
+        if (globalSock) {
+            try { fotoUrl = await globalSock.profilePictureUrl(targetJid, 'image'); } catch (e) { }
+        }
+
+        let hasil;
+        if (fotoUrl) {
+            hasil = await safeTG(() => tgBot.sendPhoto(TG_GROUP_ID, fotoUrl, { caption: teksInfo, message_thread_id: threadId, parse_mode: 'Markdown' }));
+        } else {
+            hasil = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `${teksInfo}\n\n_(Tidak ada foto profil / diprivasi)_`, { message_thread_id: threadId, parse_mode: 'Markdown' }));
         }
         jadwalkanHapusPerintah(hasil?.message_id);
         return hasil;
@@ -672,9 +740,11 @@ tgBot.on('message', async (msg) => {
 
             let opsiKirim;
             if (msg.reply_to_message) {
+                console.log(`[REPLY DEBUG] User reply ke tgMsgId=${msg.reply_to_message.message_id} di threadId=${threadId}, targetJid=${targetJid}`);
                 const target = await ambilPemetaanReply(msg.reply_to_message.message_id);
                 if (target && target.waJid === targetJid) {
                     opsiKirim = { quoted: target.waMsg };
+                    console.log('[REPLY DEBUG] opsiKirim diset dgn quoted.');
                 }
             }
 
@@ -720,13 +790,10 @@ async function jalankanPekerjaAntrean() {
             if (antreanPesan.length > 0) {
                 const { infoPesan, pushName, isHistory, isFromMe } = antreanPesan[0];
                 try {
-                    await eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe);
+                    // Mencegah macet jika API Telegram nyangkut
+                    await withTimeout(eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe), 60000, 'KirimPesan');
                 } catch (e) {
-                    console.error('[ANTREAN PESAN ERROR]', e.message);
-                    try {
-                        // BACKUP DARURAT: Apapun error-nya, kirim notifikasi ke Telegram agar pesan tidak hilang gaib!
-                        await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `⚠️ *Sistem gagal mem-backup satu pesan*\nDari: ${pushName}\nError: ${e.message}`));
-                    } catch(err) {}
+                    console.error('[ANTREAN PESAN ERROR] Melewati 1 pesan yg gagal diproses:', e.message);
                 }
                 antreanPesan.shift();
                 if (antreanPesan.length % 10 === 0) perbaruiStatusTelegram(statusHpSaatIni);
@@ -734,9 +801,9 @@ async function jalankanPekerjaAntrean() {
             } else {
                 const infoStatus = antreanStatus.shift();
                 try {
-                    await prosesStatusBroadcast(infoStatus);
+                    await withTimeout(prosesStatusBroadcast(infoStatus), 60000, 'KirimStatus');
                 } catch (e) {
-                    console.error('[ANTREAN STATUS ERROR]', e.message);
+                    console.error('[ANTREAN STATUS ERROR] Melewati 1 story yg gagal diproses:', e.message);
                 }
                 await delay(800);
             }
