@@ -327,7 +327,7 @@ async function prosesProtokolPesan(protoMsg, jidPelaku) {
 
     let note;
     if (isHapus) {
-        note = `🗑️ *Pesan Dihapus*\n👤 Dari: ${namaPengirim}\n💬 Isi pesan: "${dataAsli?.teks \vert{}\vert{} '(media, isi tidak tercatat)'}"${linkAsli}`;
+        note = `🗑️ *Pesan Dihapus*\n👤 Dari: ${namaPengirim}\n💬 Isi pesan: "${dataAsli?.teks || '(media, isi tidak tercatat)'}"${linkAsli}`;
     } else {
         const teksBaru = protoMsg.editedMessage?.conversation || protoMsg.editedMessage?.extendedTextMessage?.text || '(media/tidak terbaca)';
         note = `✏️ *Pesan Diedit*\n👤 Dari: ${namaPengirim}\n📝 Sebelum: "${dataAsli?.teks || '(tidak tercatat)'}"\n📝 Sesudah: "${teksBaru}"${linkAsli}`;
