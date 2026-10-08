@@ -115,7 +115,8 @@ let dbConfig = {
     kataKunci: [], 
     blacklistKataKunci: [], 
     blacklistStatus: [],
-    stealthMode: true // Mode Hantu otomatis hidup di awal
+    stealthMode: true, // Mode Hantu otomatis hidup di awal
+    lidMap: {} // [REVISI] Penambahan mapping LID ke Nomor Asli
 };
 
 const currentStatusMap = {};
@@ -233,6 +234,8 @@ async function hubungkanDatabase() {
     const config = await configCollection.findOne({ _id: 'global_settings' });
     if (config) {
         dbConfig = { ...dbConfig, ...config };
+        // [REVISI] Pastikan map lid selalu ada jika config lama belum memilikinya
+        if (!dbConfig.lidMap) dbConfig.lidMap = {};
         delete dbConfig._id;
     }
     await inisialisasiTopikSistem();
@@ -287,19 +290,40 @@ async function useMongoDBAuthState() {
 // =========================================================================
 // INFO KONTAK
 // =========================================================================
+
+// [REVISI] Fungsi ini sekarang membedah LID dan menerjemahkannya otomatis
 function ambilInfoKontak(jid, pushNameFallback) {
     if (!jid) return { nama: 'Unknown', nomor: 'Unknown', isLid: false, isGrup: false };
-    const nomor = jid.split('@')[0];
+    
     const isLid = jid.includes('@lid');
     const isGrup = jid.endsWith('@g.us');
 
-    let nama = dbConfig.kontak[jid] || pushNameFallback;
-    if (!nama) {
-        nama = isGrup ? ('Grup ' + nomor) : (isLid ? 'Kontak Pribadi (LID)' : ('+' + nomor));
-    } else if (!dbConfig.kontak[jid]) {
-        dbConfig.kontak[jid] = nama; 
+    // Menerjemahkan JID jika ia berupa LID
+    let targetPnJid = jid;
+    if (isLid && dbConfig.lidMap[jid]) {
+        targetPnJid = dbConfig.lidMap[jid];
     }
-    return { nama, nomor, isLid, isGrup };
+
+    const nomorAsli = targetPnJid.split('@')[0];
+    
+    // Cari nama menggunakan prioritas: JID asli -> LID -> Fallback
+    let nama = dbConfig.kontak[targetPnJid] || dbConfig.kontak[jid] || pushNameFallback;
+
+    if (!nama) {
+        nama = isGrup ? ('Grup ' + nomorAsli) : (isLid && targetPnJid === jid ? 'Kontak Pribadi (LID)' : ('+' + nomorAsli));
+    } else {
+        // Simpan silang agar tersinkron sempurna di cache
+        dbConfig.kontak[targetPnJid] = nama;
+        if (isLid) dbConfig.kontak[jid] = nama;
+    }
+
+    return { 
+        nama, 
+        nomor: (targetPnJid === jid && isLid) ? 'Disembunyikan (LID)' : nomorAsli, 
+        isLid, 
+        isGrup,
+        pnJid: targetPnJid
+    };
 }
 
 async function prosesProtokolPesan(protoMsg, jidPelaku) {
@@ -374,9 +398,9 @@ async function pastikanTopik(jid, pushName) {
 
     const info = ambilInfoKontak(jid, pushName);
     
-    // PERBAIKAN UI: Kontak LID tidak akan dicetak nomor acaknya di judul Folder
+    // [REVISI] UI: Kontak LID tidak akan dicetak nomor acaknya di judul Folder
     let namaFolder = info.isGrup ? '👥 GRUP: ' + info.nama : '👤 ' + info.nama;
-    if (!info.isLid && !info.isGrup) {
+    if (info.nomor !== 'Disembunyikan (LID)' && !info.isGrup) {
         namaFolder += ' (' + info.nomor + ')';
     }
     namaFolder = namaFolder.substring(0, 127);
@@ -388,9 +412,9 @@ async function pastikanTopik(jid, pushName) {
 
     if (!info.isGrup) {
         // Tampilan khusus agar info nomor tersembunyi terlihat rapi
-        const displayNum = info.isLid ? 'Nomor Disembunyikan (LID)' : `+${info.nomor}`;
+        const displayNum = info.nomor === 'Disembunyikan (LID)' ? 'Nomor Disembunyikan (LID)' : `+${info.nomor}`;
         const infoMsg = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID,
-            `ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor:${displayNum}\nStatus: 🔴 Offline`,
+            `ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor: ${displayNum}\nStatus: 🔴 Offline`,
             { message_thread_id: result.message_thread_id, parse_mode: 'Markdown' }));
         if (infoMsg) {
             dbConfig.topicInfoMsgs[jid] = infoMsg.message_id;
@@ -412,9 +436,11 @@ async function renameTopikJikaPerlu(jid, namaBaru, isGrup) {
     const threadId = dbConfig.topik[jid];
     if (!threadId) return;
 
+    // [REVISI] Update sinkronisasi ganti nama folder
     let namaTopikBaru = isGrup ? '👥 GRUP: ' + namaBaru : '👤 ' + namaBaru;
-    if (!jid.includes('@lid') && !isGrup) {
-        namaTopikBaru += ' (' + jid.split('@')[0] + ')';
+    const info = ambilInfoKontak(jid, null);
+    if (info.nomor !== 'Disembunyikan (LID)' && !isGrup) {
+        namaTopikBaru += ' (' + info.nomor + ')';
     }
     await safeTG(() => tgBot.editForumTopic(TG_GROUP_ID, threadId, { name: namaTopikBaru.substring(0, 127) }));
 }
@@ -514,7 +540,8 @@ tgBot.on('message', async (msg) => {
     if (cmd === '/info') {
         if (!targetJid) return balasPerintah(`⚠️ Jalankan di dalam topik kontak.`);
         const info = ambilInfoKontak(targetJid, null);
-        const ketLid = info.isLid ? '\n_(Komunitas/Saluran WA — nomor asli disembunyikan WhatsApp)_' : '';
+        // [REVISI] Tampilan perintah Info disesuaikan agar bisa mengambil pnJid asli jika ditautkan
+        const ketLid = info.nomor === 'Disembunyikan (LID)' ? '\n_(Komunitas/Saluran WA — nomor asli disembunyikan WhatsApp)_' : '';
         const statusOnline = currentStatusMap[targetJid] || '❔ Belum diketahui';
         const terakhirTerlihat = (statusOnline === '🔴 Offline' && lastSeenMap[targetJid])
             ? `\n🕒 Terakhir terlihat: ${waktuLokal(new Date(lastSeenMap[targetJid]))}` : '';
@@ -522,16 +549,20 @@ tgBot.on('message', async (msg) => {
         let bio = '';
         if (!info.isGrup && globalSock) {
             try {
-                const st = await globalSock.fetchStatus(targetJid);
+                const targetBio = info.pnJid || targetJid;
+                const st = await globalSock.fetchStatus(targetBio);
                 if (st?.status) bio = `\n📝 Bio: ${st.status}`;
             } catch (e) { }
         }
 
-        const teksInfo = `ℹ️ *DETAIL KONTAK*\n\n👤 Nama: ${info.nama}\n📞 Nomor: \`${info.isLid ? 'LID' : '+' + info.nomor}\`\n💬 Tipe: ${info.isGrup ? 'Grup' : 'Pribadi'}\n🟢 Status: ${statusOnline}${terakhirTerlihat}${bio}\n🆔 JID: \`${targetJid}\`${ketLid}`;
+        const teksInfo = `ℹ️ *DETAIL KONTAK*\n\n👤 Nama: ${info.nama}\n📞 Nomor: \`${info.nomor !== 'Disembunyikan (LID)' ? '+' + info.nomor : 'LID'}\`\n💬 Tipe: ${info.isGrup ? 'Grup' : 'Pribadi'}\n🟢 Status: ${statusOnline}${terakhirTerlihat}${bio}\n🆔 JID: \`${info.pnJid || targetJid}\`${ketLid}`;
 
         let fotoUrl = null;
         if (globalSock) {
-            try { fotoUrl = await globalSock.profilePictureUrl(targetJid, 'image'); } catch (e) { }
+            try { 
+                const targetPic = info.pnJid || targetJid;
+                fotoUrl = await globalSock.profilePictureUrl(targetPic, 'image'); 
+            } catch (e) { }
         }
 
         let hasil;
@@ -556,7 +587,7 @@ tgBot.on('message', async (msg) => {
         const baris = daftarJid.map((j) => {
             const nama = ambilInfoKontak(j, null).nama;
             const st = currentStatusMap[j] || '❔ Belum diketahui';
-            return `${st === '🟢 Online' ? '🟢' : st.includes('Mengetik') || st.includes('Merekam') ? '🟡' : '🔴'} ${nama}`;
+            return `${st === '🟢 Online' ? '🟢' : st.includes('Mengetik') \vert{}\vert{} st.includes('Merekam') ? '🟡' : '🔴'} ${nama}`;
         });
         return balasPerintah(`📶 *STATUS ONLINE KONTAK*\n\n${baris.join('\n')}`, { parse_mode: 'Markdown' });
     }
@@ -1134,18 +1165,42 @@ async function mulaiBotWhatsApp() {
 
         globalSock = sock;
 
+        // [REVISI] Menangkap dan memetakan pembaruan kontak baru dari WA ke memori
         sock.ev.on('contacts.upsert', async (contacts) => {
+            let changed = false;
             for (const c of contacts) {
                 const nama = c.name || c.notify;
-                if (nama) await renameTopikJikaPerlu(c.id, nama, false);
+                if (c.lid && c.id) {
+                    dbConfig.lidMap[c.lid] = c.id;
+                    changed = true;
+                }
+                if (nama) {
+                    if (c.id) await renameTopikJikaPerlu(c.id, nama, false);
+                    if (c.lid) dbConfig.kontak[c.lid] = nama;
+                    changed = true;
+                }
             }
+            if (changed) await simpanKonfigurasiDB();
         });
+
+        // [REVISI] Menangkap update profil kontak 
         sock.ev.on('contacts.update', async (updates) => {
+            let changed = false;
             for (const c of updates) {
                 const nama = c.name || c.notify;
-                if (nama) await renameTopikJikaPerlu(c.id, nama, false);
+                if (c.lid && c.id) {
+                    dbConfig.lidMap[c.lid] = c.id;
+                    changed = true;
+                }
+                if (nama) {
+                    if (c.id) await renameTopikJikaPerlu(c.id, nama, false);
+                    if (c.lid) dbConfig.kontak[c.lid] = nama;
+                    changed = true;
+                }
             }
+            if (changed) await simpanKonfigurasiDB();
         });
+
         sock.ev.on('groups.upsert', async (groups) => {
             for (const g of groups) if (g.subject) await renameTopikJikaPerlu(g.id, g.subject, true);
         });
@@ -1167,11 +1222,22 @@ async function mulaiBotWhatsApp() {
         });
 
         let bufferRiwayat = [];
+        
+        // [REVISI] Menyimpan pemetaan data massal saat history sync 
         sock.ev.on('messaging-history.set', async ({ messages, contacts }) => {
             if (contacts) {
                 for (const c of contacts) {
                     const nama = c.name || c.notify;
-                    if (nama && c.id) dbConfig.kontak[c.id] = dbConfig.kontak[c.id] || nama;
+                    const pnJid = c.id;
+                    const lidJid = c.lid;
+
+                    if (nama) {
+                        if (pnJid) dbConfig.kontak[pnJid] = nama;
+                        if (lidJid) dbConfig.kontak[lidJid] = nama;
+                    }
+                    if (lidJid && pnJid) {
+                        dbConfig.lidMap[lidJid] = pnJid;
+                    }
                 }
                 await simpanKonfigurasiDB();
             }
@@ -1231,7 +1297,7 @@ async function mulaiBotWhatsApp() {
             if (!msgId) return;
 
             const info = ambilInfoKontak(jid, null);
-            let baris = `ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor: +${info.nomor}\nStatus: `;
+            let baris = `ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor: ${info.nomor !== 'Disembunyikan (LID)' ? '+' + info.nomor : 'LID'}\nStatus: `;
             baris += icon;
             if (icon === '🔴 Offline' && lastSeenMap[jid]) {
                 baris += `\n🕒 Terakhir terlihat: ${waktuLokal(new Date(lastSeenMap[jid]))}`;
