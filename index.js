@@ -599,7 +599,7 @@ tgBot.on('message', async (msg) => {
             const nama = ambilInfoKontak(j, null).nama;
             const st = currentStatusMap[j] || '❔ Belum diketahui';
             // [TYPO FIX] Mengganti \vert{}\vert{} menjadi ||
-            return `${st === '🟢 Online' ? '🟢' : st.includes('Mengetik') \vert{}\vert{} st.includes('Merekam') ? '🟡' : '🔴'} ${nama}`;
+            return `${st === '🟢 Online' ? '🟢' : st.includes('Mengetik') || st.includes('Merekam') ? '🟡' : '🔴'} ${nama}`;
         });
         return balasPerintah(`📶 *STATUS ONLINE KONTAK*\n\n${baris.join('\n')}`, { parse_mode: 'Markdown' });
     }
