@@ -8,7 +8,7 @@ let isConnected = false;
 
 async function inisialisasiMTProto(configCollection, apiId, apiHash, botToken) {
     if (!apiId || !apiHash) {
-        console.warn('⚠️ [MTProto] TG_API_ID atau TG_API_HASH belum diatur. Bypass media besar >50MB tidak aktif.');
+        console.warn('⚠️ [MTProto] TG_API_ID atau TG_API_HASH belum diatur.');
         return false;
     }
 
@@ -17,20 +17,25 @@ async function inisialisasiMTProto(configCollection, apiId, apiHash, botToken) {
         const savedSession = docConfig?.tg_mtproto_bot_session || '';
         const stringSession = new StringSession(savedSession);
 
-        // Koneksi TCP murni untuk hemat RAM (useWSS: false)
         mtprotoClient = new TelegramClient(stringSession, Number(apiId), apiHash, {
             connectionRetries: 5,
             useWSS: false,
+            autoReconnect: true,
         });
+
+        mtprotoClient.setLogLevel("warn");
 
         await mtprotoClient.start({
             botAuthToken: botToken,
         });
 
+        if (mtprotoClient._updateLoop) {
+            mtprotoClient._updateLoop = async () => {};
+        }
+
         isConnected = true;
         console.log('✅ [MTProto] Terhubung langsung ke Data Center Telegram (Bot Mode).');
 
-        // Cadangkan sesi ke MongoDB
         const currentSessionString = mtprotoClient.session.save();
         if (currentSessionString !== savedSession) {
             await configCollection.updateOne(
@@ -38,40 +43,51 @@ async function inisialisasiMTProto(configCollection, apiId, apiHash, botToken) {
                 { $set: { tg_mtproto_bot_session: currentSessionString } },
                 { upsert: true }
             );
-            console.log('[MTProto] String Sesi Bot berhasil diamankan ke MongoDB.');
         }
         return true;
     } catch (e) {
-        console.error('❌ [MTProto ERROR]', e.message);
+        console.error('❌ [MTProto INIT ERROR]', e.message);
         return false;
     }
 }
 
 async function uploadBesarMTProto(filePath, namaFile, mimeType, caption, targetGroupId, threadId) {
-    if (!isConnected || !mtprotoClient) throw new Error("Koneksi MTProto belum siap atau gagal.");
+    if (!isConnected || !mtprotoClient) {
+        throw new Error("Koneksi MTProto belum siap atau gagal.");
+    }
+
+    if (!fs.existsSync(filePath)) {
+        throw new Error(`File temporer tidak ditemukan: ${filePath}`);
+    }
 
     const stats = fs.statSync(filePath);
+    if (stats.size === 0) {
+        throw new Error("File unduhan kosong (0 bytes).");
+    }
+
     const toUpload = new CustomFile(namaFile, stats.size, filePath);
 
-    // KUNCI OPTIMASI RAM: workers = 1 agar chunk memory minimal
     const fileHandle = await mtprotoClient.uploadFile({
         file: toUpload,
-        workers: 1, 
+        workers: 1,
     });
 
-    const groupIdNum = typeof targetGroupId === 'string' ? Number(targetGroupId) : targetGroupId;
+    const inputPeer = await mtprotoClient.getInputEntity(targetGroupId);
 
-    const sentMsg = await mtprotoClient.sendFile(groupIdNum, {
+    const sendOptions = {
         file: fileHandle,
-        caption: caption,
-        replyTo: threadId,
-        parseMode: 'markdown',
+        caption: caption || '',
         attributes: [
             new Api.DocumentAttributeFilename({ fileName: namaFile })
         ]
-    });
+    };
 
-    return { message_id: sentMsg.id }; 
+    if (threadId) {
+        sendOptions.replyTo = Number(threadId);
+    }
+
+    const sentMsg = await mtprotoClient.sendFile(inputPeer, sendOptions);
+    return { message_id: sentMsg.id };
 }
 
 module.exports = { inisialisasiMTProto, uploadBesarMTProto };
