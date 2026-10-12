@@ -59,7 +59,6 @@ tgBot.setMyCommands([
     { command: 'restart', description: 'Restart server bot' }
 ]);
 
-// OPTIMASI RAM: Penambahan properti maxKeys dan checkperiod untuk cegah Memory Leak
 const cacheAntiSpam = new NodeCache({ stdTTL: 3600, maxKeys: 1500, checkperiod: 600 });
 const cacheAntiDelete = new NodeCache({ stdTTL: 86400, maxKeys: 1500, checkperiod: 600 });
 const cacheDedupProtokol = new NodeCache({ stdTTL: 120, maxKeys: 500 });
@@ -107,7 +106,7 @@ async function ambilPemetaanReply(tgMsgId) {
 let globalSock = null;
 let sedangMenungguPairing = false;
 let sudahMemintaKode = false;
-let isUploadingBigFile = false; // MUTEX LOCK: Cegah antrean file raksasa paralel
+let isUploadingBigFile = false;
 const lastSeenMap = {}; 
 
 let dbConfig = {
@@ -117,7 +116,7 @@ let dbConfig = {
     muted: [],
     nomor_wa_utama: process.env.NOMOR_WA_UTAMA || null,
     pinned_status_msg_id: null,
-    maxMediaMB: 2000, // Default bisa sampai 2000MB berkat GramJS
+    maxMediaMB: 2000,
     topicInfoMsgs: {},
     kataKunci: [], 
     blacklistKataKunci: [], 
@@ -246,7 +245,6 @@ async function hubungkanDatabase() {
     }
     await inisialisasiTopikSistem();
 
-    // Inisialisasi GramJS (MTProto)
     await inisialisasiMTProto(configCollection, TG_API_ID, TG_API_HASH, TG_TOKEN);
 }
 
@@ -550,11 +548,11 @@ tgBot.on('message', async (msg) => {
 
     if (cmd === '/setmedia') {
         const mb = parseInt(args[1]);
-        if (isNaN(mb) || mb <= 0) return balasPerintah(`⚠️ Ketik: \`/setmedia 10\``, { parse_mode: 'Markdown' });
+        if (isNaN(mb) || mb <= 0) return balasPerintah(`⚠️ Ketik: \`/setmedia 100\``, { parse_mode: 'Markdown' });
         dbConfig.maxMediaMB = mb;
         await simpanKonfigurasiDB();
         perbaruiStatusTelegram(statusHpSaatIni, true);
-        return balasPerintah(`✅ Batas media: *${mb} MB*`, { parse_mode: 'Markdown' });
+        return balasPerintah(`✅ Batas media diperbarui: *${mb} MB*`, { parse_mode: 'Markdown' });
     }
 
     if (cmd === '/info') {
@@ -596,7 +594,7 @@ tgBot.on('message', async (msg) => {
 
     if (cmd === '/status') {
         const ram = (process.memoryUsage().rss / 1024 / 1024).toFixed(2);
-        return balasPerintah(`📊 RAM: ${ram} MB\n🕶️ Stealth: ${dbConfig.stealthMode ? 'Aktif' : 'Nonaktif'}\n🔌 WA: ${globalSock ? 'Terhubung' : 'Terputus'}\n📦 Antrean: ${antreanPesan.length} msg +${antreanStatus.length} story`);
+        return balasPerintah(`📊 RAM: ${ram} MB\n🕶️ Stealth: ${dbConfig.stealthMode ? 'Aktif' : 'Nonaktif'}\n🔌 WA: ${globalSock ? 'Terhubung' : 'Terputus'}\n📁 Batas Media: ${dbConfig.maxMediaMB} MB\n📦 Antrean: ${antreanPesan.length} msg +${antreanStatus.length} story`);
     }
 
     if (cmd === '/online') {
@@ -803,7 +801,7 @@ async function jalankanPekerjaAntrean() {
                 const task = antreanPesan.splice(targetIdx, 1)[0];
 
                 try {
-                    await withTimeout(eksekusiKirimKeTelegram(task.infoPesan, task.pushName, task.isHistory, task.isFromMe), 60000, 'KirimPesan');
+                    await withTimeout(eksekusiKirimKeTelegram(task.infoPesan, task.pushName, task.isHistory, task.isFromMe), 90000, 'KirimPesan');
                 } catch (e) {
                     console.error('[ANTREAN PESAN ERROR] Melewati 1 pesan:', e.message);
                 }
@@ -863,7 +861,7 @@ async function prosesStatusBroadcast(infoPesan) {
                     tgBot.sendVideo(TG_GROUP_ID, buffer, { ...tgOpts, message_thread_id: tId }, { filename: 'status.mp4', contentType: 'video/mp4' })
                 );
             }
-            if (global.gc) global.gc(); // OPTIMASI: Bebaskan RAM media
+            if (global.gc) global.gc();
         } else {
             hasilStatus = await kirimKeTopik({ sysKey: 'statusWA' }, (tId) => tgBot.sendMessage(TG_GROUP_ID, caption, { message_thread_id: tId, parse_mode: 'Markdown' }));
         }
@@ -901,7 +899,7 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
     
     if (!isiPesan) return; 
 
-    // REVISI DETEKSI VIEW-ONCE LEBIH AWAL
+    // REVISI DETEKSI VIEW-ONCE
     let isViewOnce = false;
     if (isiPesan.viewOnceMessage) { isViewOnce = true; isiPesan = isiPesan.viewOnceMessage.message; }
     else if (isiPesan.viewOnceMessageV2) { isViewOnce = true; isiPesan = isiPesan.viewOnceMessageV2.message; }
@@ -989,9 +987,8 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
             let buffer = Buffer.alloc(0);
             for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
             
-            // Perbaikan Stiker Bug: Wajib menggunakan mimetype khusus webp
             await kirim((tId) => tgBot.sendSticker(TG_GROUP_ID, buffer, { message_thread_id: tId }, { filename: 'sticker.webp', contentType: 'image/webp' }));
-            if (global.gc) global.gc(); // Bebaskan RAM
+            if (global.gc) global.gc();
         } catch (e) { console.error('[STIKER ERROR]', e.message); }
         return;
     }
@@ -1049,7 +1046,6 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
         if (pesanMedia) {
             const ukuranBytes = parseInt(pesanMedia.fileLength || 0);
             
-            // Limit dari perintah /setmedia pengguna
             if (ukuranBytes > dbConfig.maxMediaMB * 1024 * 1024) {
                 const fallbackGagalBesar = `⚠️ [Media ${Math.round(ukuranBytes/1024/1024)}MB dilewati (Batas: ${dbConfig.maxMediaMB}MB)]`;
                 const hasilKirim = await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}${awalan}${prefixArah}${quoteBlock}${fallbackGagalBesar}\n💬 ${teksKonten}`, { message_thread_id: tId, parse_mode: 'Markdown' }));
@@ -1091,8 +1087,6 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
                 const isMediaRaksasa = ukuranBytes > 49 * 1024 * 1024;
 
                 if (isMediaRaksasa) {
-                    // MENGGUNAKAN MTPROTO
-                    // MUTEX LOCK: Tunggu jika ada file besar lain yang sedang diunggah
                     while (isUploadingBigFile) { 
                         await delay(2000); 
                     }
@@ -1102,32 +1096,58 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
                     let notifTunggu = null;
 
                     try {
-                        const writeStream = fs.createWriteStream(tempFilePath);
-                        notifTunggu = await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `⏳ *Menarik file raksasa dari WA...* (${Math.round(ukuranBytes/1024/1024)} MB)`, { message_thread_id: tId, parse_mode: 'Markdown' }));
+                        notifTunggu = await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `⏳ *Mengunduh file raksasa dari WhatsApp...* (${Math.round(ukuranBytes / 1024 / 1024)} MB)`, { message_thread_id: tId, parse_mode: 'Markdown' }));
 
+                        const writeStream = fs.createWriteStream(tempFilePath);
                         const stream = await downloadContentFromMessage(pesanMedia, tipeUnduh);
-                        for await (const chunk of stream) {
-                            writeStream.write(chunk);
-                        }
-                        writeStream.end();
-                        await new Promise(resolve => writeStream.on('finish', resolve));
+
+                        await new Promise((resolve, reject) => {
+                            stream.on('data', (chunk) => writeStream.write(chunk));
+                            stream.on('end', () => writeStream.end());
+                            writeStream.on('finish', resolve);
+                            writeStream.on('error', reject);
+                            stream.on('error', reject);
+                        });
+
+                        const cekUkuranFisik = fs.statSync(tempFilePath).size;
+                        console.log(`[MTProto] File siap diunggah: ${namaFileFinal} (${Math.round(cekUkuranFisik / 1024 / 1024)} MB)`);
 
                         if (notifTunggu) {
-                            await safeTG(() => tgBot.editMessageText(`🚀 *Meneruskan file ke Telegram via MTProto...*`, { chat_id: TG_GROUP_ID, message_id: notifTunggu.message_id, parse_mode: 'Markdown' }));
+                            await safeTG(() => tgBot.editMessageText(`🚀 *Meneruskan file (${Math.round(cekUkuranFisik / 1024 / 1024)} MB) ke Telegram via MTProto...*`, { 
+                                chat_id: TG_GROUP_ID, 
+                                message_id: notifTunggu.message_id, 
+                                parse_mode: 'Markdown' 
+                            }));
                         }
 
-                        hasilKirim = await kirim(async (tId) => {
-                            return await uploadBesarMTProto(tempFilePath, namaFileFinal, mimeTypeFinal, teksCaption, TG_GROUP_ID, tId);
-                        });
+                        const targetThreadId = threadIdTarget || dbConfig.sysTopics.audit;
+                        hasilKirim = await uploadBesarMTProto(tempFilePath, namaFileFinal, mimeTypeFinal, teksCaption, TG_GROUP_ID, targetThreadId);
+
+                        if (hasilKirim?.message_id && threadIdTarget) {
+                            simpanPemetaanReply(hasilKirim.message_id, { waJid: idPengirim, waMsg: { key: infoPesan.key, message: infoPesan.message } });
+                            cacheWaMsgToTg.set(infoPesan.key.id, hasilKirim.message_id);
+                        }
+
+                        if (notifTunggu) {
+                            await safeTG(() => tgBot.deleteMessage(TG_GROUP_ID, notifTunggu.message_id).catch(() => {}));
+                        }
+                    } catch (uploadErr) {
+                        console.error('[MTPROTO UPLOAD ERROR DETAIL]', uploadErr);
+                        if (notifTunggu) {
+                            await safeTG(() => tgBot.editMessageText(`❌ *Gagal mengunggah media besar:* ${uploadErr.message}`, {
+                                chat_id: TG_GROUP_ID,
+                                message_id: notifTunggu.message_id,
+                                parse_mode: 'Markdown'
+                            }));
+                        }
                     } finally {
-                        // Bersihkan disk
-                        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
-                        if (notifTunggu) await safeTG(() => tgBot.deleteMessage(TG_GROUP_ID, notifTunggu.message_id).catch(()=>{}));
-                        isUploadingBigFile = false; // Buka kunci mutex
-                        if (global.gc) global.gc(); // Panggil GC instan
+                        if (fs.existsSync(tempFilePath)) {
+                            try { fs.unlinkSync(tempFilePath); } catch (e) {}
+                        }
+                        isUploadingBigFile = false;
+                        if (global.gc) global.gc();
                     }
                 } else {
-                    // MENGGUNAKAN BOT API BIASA
                     const stream = await downloadContentFromMessage(pesanMedia, tipeUnduh);
                     let buffer = Buffer.alloc(0);
                     for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
@@ -1145,7 +1165,7 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
                     } else {
                         hasilKirim = await kirim((tId) => tgBot.sendDocument(TG_GROUP_ID, buffer, { ...tgOpts, message_thread_id: tId }, fileOpts));
                     }
-                    if (global.gc) global.gc(); // Panggil GC
+                    if (global.gc) global.gc();
                 }
 
                 await cekKataKunci(idPengirim, isFromMe, isHistory, namaPengirimFinal, teksKonten, hasilKirim);
@@ -1163,7 +1183,6 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
     } catch (e) { console.error('[TG SEND ERROR]', e.message); }
 }
 
-// FITUR BARU: Notifikasi Deep-Link Mention
 async function notifikasiMentionDiri(botDiTag, idPengirim, hasilKirim, infoUtama, teksKonten) {
     if (!botDiTag || !hasilKirim?.message_id) return;
     const threadId = dbConfig.topik[idPengirim];
@@ -1533,7 +1552,6 @@ async function mulaiBotWhatsApp() {
 
             const idPesan = infoPesan.key.id;
             
-            // KUNCI OPTIMASI RAM: Filter AntiSpam lebih awal agar tidak memakan CPU/RAM ekstra
             if (cacheAntiSpam.has(idPesan)) return;
             cacheAntiSpam.set(idPesan, true);
 
@@ -1605,7 +1623,6 @@ process.on('SIGTERM', async () => {
     process.exit(0);
 });
 
-// DISK SWEEPER OTOMATIS
 function bersihkanTempMedia() {
     const tmp = os.tmpdir();
     fs.readdirSync(tmp).forEach(file => {
