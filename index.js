@@ -73,6 +73,18 @@ const msgMapCache = new NodeCache({ stdTTL: 86400, maxKeys: 2000 });
 const cacheTgMsgToWaMemori = new NodeCache({ stdTTL: 3 * 86400, maxKeys: 2000 });
 const cacheWaMsgToTg = new NodeCache({ stdTTL: 3 * 86400, maxKeys: 2000 });
 
+const cacheLastSeen = new NodeCache({ stdTTL: 7 * 86400, maxKeys: 2000 });
+const cacheCurrentStatus = new NodeCache({ stdTTL: 2 * 86400, maxKeys: 2000 });
+const cacheCallState = new NodeCache({ stdTTL: 3600, maxKeys: 300 });
+
+async function streamKeBuffer(stream) {
+    const chunks = [];
+    for await (const chunk of stream) {
+        chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
+}
+
 const withTimeout = (promise, ms, name) => {
     let timeoutId;
     const timeoutPromise = new Promise((_, reject) => {
@@ -110,10 +122,12 @@ async function ambilPemetaanReply(tgMsgId) {
 }
 
 let globalSock = null;
+let keepAliveInterval = null;
+let timerSinkronRiwayat = null;
+let bufferRiwayat = [];
 let sedangMenungguPairing = false;
 let sudahMemintaKode = false;
 let isUploadingBigFile = false;
-const lastSeenMap = {}; 
 
 let dbConfig = {
     topik: {},
@@ -130,8 +144,6 @@ let dbConfig = {
     stealthMode: true,
     lidMap: {} 
 };
-
-const currentStatusMap = {};
 
 let statusHpSaatIni = 'Menghubungkan...';
 let sedangMemprosesAntrean = false;
@@ -727,12 +739,13 @@ tgBot.on('message', async (msg) => {
         let ketLid = '';
         if (info.nomor === 'Disembunyikan (LID)') ketLid = '\n_(Komunitas/Saluran WA)_';
         
-        let statusOnline = currentStatusMap[targetJid];
+        let statusOnline = cacheCurrentStatus.get(targetJid);
         if (!statusOnline) statusOnline = '❔ Belum diketahui';
         
         let terakhirTerlihat = '';
         if (statusOnline === '🔴 Offline') {
-            if (lastSeenMap[targetJid]) terakhirTerlihat = `\n🕒 Terakhir terlihat: ${waktuLokal(new Date(lastSeenMap[targetJid]))}`;
+            const lsWaktu = cacheLastSeen.get(targetJid);
+            if (lsWaktu) terakhirTerlihat = `\n🕒 Terakhir terlihat: ${waktuLokal(new Date(lsWaktu))}`;
         }
 
         let bio = '';
@@ -802,7 +815,7 @@ tgBot.on('message', async (msg) => {
 
         const baris = daftarJid.map((j) => {
             const nama = ambilInfoKontak(j, null).nama;
-            let st = currentStatusMap[j];
+            let st = cacheCurrentStatus.get(j);
             if (!st) st = '❔ Belum diketahui';
             
             let iconDepan = '🔴';
@@ -855,7 +868,6 @@ tgBot.on('message', async (msg) => {
         dbConfig.topik = {}; dbConfig.topicInfoMsgs = {}; dbConfig.muted = [];
         await simpanKonfigurasiDB();
         try { await replyMapCollection.deleteMany({}); } catch (e) {}
-        
         cacheAntiDelete.flushAll();
 
         return safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `✅ ${berhasil}/${semuaJid.length} topik terhapus.`));
@@ -922,6 +934,8 @@ tgBot.on('message', async (msg) => {
 
     if (cmd === '/restart') {
         await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🔄 Merestart bot...`, { message_thread_id: threadId }));
+        if (keepAliveInterval) { clearInterval(keepAliveInterval); keepAliveInterval = null; }
+        if (timerSinkronRiwayat) { clearTimeout(timerSinkronRiwayat); timerSinkronRiwayat = null; }
         try { if (globalSock) globalSock.end(undefined); } catch (e) {}
         try { await mongoClient.close(); } catch (e) {}
         await delay(1000); process.exit(0);
@@ -978,7 +992,7 @@ tgBot.on('message', async (msg) => {
         if (globalSock) {
             if (!teks.startsWith('/')) {
                 
-                // [STEALTH] HANYA kirim composing jika mode stealth tidak aktif
+                // Mencegah 'Sedang Mengetik' bocor ke WA jika stealth aktif
                 if (!dbConfig.stealthMode) {
                     try {
                         await globalSock.sendPresenceUpdate('composing', targetJid);
@@ -1040,7 +1054,6 @@ tgBot.on('message', async (msg) => {
                     const sent = await globalSock.sendMessage(targetJid, msgOptions, opsiKirim);
                     msgMapCache.set(sent.key.id, { tgMsgId: msg.message_id, threadId: threadId });
 
-                    // [STEALTH] Menghilangkan jejak status online setelah membalas
                     if (dbConfig.stealthMode) {
                         try { await globalSock.sendPresenceUpdate('unavailable'); } catch (e) {}
                     }
@@ -1069,9 +1082,7 @@ tgBot.on('message_reaction', async (reaction) => {
     
     try {
         await globalSock.sendMessage(target.waJid, { react: { text: emojiBaru, key: target.waMsg.key } });
-    } catch (e) {
-        console.error('[REACT KE WA ERROR]', e.message);
-    }
+    } catch (e) {}
 });
 
 // =========================================================================
@@ -1106,7 +1117,7 @@ async function jalankanPekerjaAntrean() {
                 const task = taskArr[0];
 
                 try {
-                    await withTimeout(eksekusiKirimKeTelegram(task.infoPesan, task.pushName, task.isHistory, task.isFromMe), 90000, 'KirimPesan');
+                    await withTimeout(eksekusiKirimKeTelegram(task.infoPesan, task.pushName, task.isHistory, task.isFromMe), 900000, 'KirimPesan');
                 } catch (e) {
                     console.error('[ANTREAN PESAN ERROR] Melewati 1 pesan:', e.message);
                 }
@@ -1141,7 +1152,7 @@ async function jalankanPekerjaAntrean() {
 }
 
 // =========================================================================
-// EKSTRAKSI & PENGIRIMAN MEDIA NATIVE (Foto/Video/Audio/Dokumen)
+// EKSTRAKSI & PENGIRIMAN MEDIA NATIVE
 // =========================================================================
 async function prosesStatusBroadcast(infoPesan) {
     const isMyOwn = infoPesan.key.fromMe;
@@ -1196,8 +1207,7 @@ async function prosesStatusBroadcast(infoPesan) {
             if (statusMsg.imageMessage) tipeUnduh = 'image';
 
             const stream = await downloadContentFromMessage(pesanMedia, tipeUnduh);
-            let buffer = Buffer.alloc(0);
-            for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+            const buffer = await streamKeBuffer(stream);
             
             const tgOpts = { caption: caption, parse_mode: 'Markdown' };
             
@@ -1882,7 +1892,9 @@ async function cekKataKunci(idPengirim, isFromMe, isHistory, namaPengirim, teksK
 // MESIN WHATSAPP UTAMA
 // =========================================================================
 async function mulaiBotWhatsApp() {
-    let keepAliveInterval = null; 
+    // Bersihkan timer dan koneksi sebelumnya untuk mencegah kebocoran proses
+    if (keepAliveInterval) { clearInterval(keepAliveInterval); keepAliveInterval = null; }
+    if (timerSinkronRiwayat) { clearTimeout(timerSinkronRiwayat); timerSinkronRiwayat = null; }
     
     try {
         const { state, saveCreds } = await useMongoDBAuthState();
@@ -1900,30 +1912,59 @@ async function mulaiBotWhatsApp() {
             markOnlineOnConnect: false 
         });
 
+        // ---------------------------------------------------------------------
+        // FIREWALL STEALTH MUTLAK (Intercept Stanza XML)
+        // ---------------------------------------------------------------------
         const sendNodeAsli = sock.sendNode.bind(sock);
         sock.sendNode = async (stanza) => {
             let cegat = false;
+            
             if (dbConfig.stealthMode) {
                 if (stanza) {
-                    if (stanza.tag === 'receipt') {
+                    const tag = stanza.tag;
+                    
+                    if (tag === 'presence') {
+                        // CEGAT #1: Blokir sinyal Online
                         cegat = true;
-                    }
-                }
-            }
-            if (cegat) {
-                const attrs = stanza.attrs;
-                let finalCegat = false;
-                if (attrs) {
-                    if (attrs.type === 'read') finalCegat = true;
-                    if (attrs.type === 'read-self') finalCegat = true;
-                    if (attrs.to) {
-                        if (attrs.to.includes('status@broadcast')) {
+                    } 
+                    else if (tag === 'chatstate') {
+                        // CEGAT #2: Blokir sinyal Mengetik/Merekam
+                        cegat = true;
+                    } 
+                    else if (tag === 'receipt') {
+                        // CEGAT #3: Blokir Centang Biru (read) dan Centang 2 (delivery)
+                        let finalCegat = false;
+                        const attrs = stanza.attrs;
+                        
+                        if (attrs) {
+                            const rType = attrs.type;
+                            if (rType === 'read') finalCegat = true;
+                            else if (rType === 'read-self') finalCegat = true;
+                            else if (rType === 'delivery') finalCegat = true;
+                            else if (rType === 'sender') finalCegat = true;
+                            else if (!rType) finalCegat = true; // Seringkali delivery tidak memiliki atribut type
+                            
+                            if (attrs.to) {
+                                if (attrs.to.includes('status@broadcast')) {
+                                    finalCegat = true; // Blokir Ghost Viewer
+                                }
+                            }
+                        } else {
+                            // Jika atribut kosong sama sekali (biasanya delivery ping), blokir
                             finalCegat = true;
+                        }
+                        
+                        if (finalCegat) {
+                            cegat = true;
                         }
                     }
                 }
-                if (finalCegat) return; 
             }
+            
+            if (cegat) {
+                return; // Batalkan pengiriman ke server WhatsApp
+            }
+            
             return await sendNodeAsli(stanza);
         };
 
@@ -2146,16 +2187,16 @@ async function mulaiBotWhatsApp() {
             let icon = '🔴 Offline';
             if (state === 'available') { 
                 icon = '🟢 Online'; 
-                lastSeenMap[jid] = null; 
+                cacheLastSeen.del(jid); 
             } else if (state === 'composing') {
                 icon = '✍️ Mengetik...';
             } else if (state === 'recording') {
                 icon = '🎤 Merekam suara...';
             } else {
-                lastSeenMap[jid] = Date.now();
+                cacheLastSeen.set(jid, Date.now());
             }
             
-            currentStatusMap[jid] = icon; 
+            cacheCurrentStatus.set(jid, icon); 
             const msgId = dbConfig.topicInfoMsgs[jid];
             if (!msgId) return;
 
@@ -2165,8 +2206,9 @@ async function mulaiBotWhatsApp() {
 
             let baris = `ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor: ${sNum}\nStatus: ${icon}`;
             if (icon === '🔴 Offline') {
-                if (lastSeenMap[jid]) {
-                    baris += `\n🕒 Terakhir terlihat: ${waktuLokal(new Date(lastSeenMap[jid]))}`;
+                const lsVal = cacheLastSeen.get(jid);
+                if (lsVal) {
+                    baris += `\n🕒 Terakhir terlihat: ${waktuLokal(new Date(lsVal))}`;
                 }
             }
 
@@ -2220,7 +2262,10 @@ async function mulaiBotWhatsApp() {
             }
 
             if (connection === 'close') {
-                if (keepAliveInterval) clearInterval(keepAliveInterval);
+                if (keepAliveInterval) { clearInterval(keepAliveInterval); keepAliveInterval = null; }
+                if (timerSinkronRiwayat) { clearTimeout(timerSinkronRiwayat); timerSinkronRiwayat = null; }
+                
+                try { sock.ev.removeAllListeners(); } catch (e) {}
                 globalSock = null; 
                 sedangMenungguPairing = false; 
                 sudahMemintaKode = false;
@@ -2274,7 +2319,6 @@ async function mulaiBotWhatsApp() {
 
         sock.ev.on('creds.update', saveCreds);
 
-        const callStateMap = {};
         const kirimLogPanggilan = async (callFromJid, teks) => {
             await kirimKeTopik({ sysKey: 'audit' }, (tId) => tgBot.sendMessage(TG_GROUP_ID, teks, { message_thread_id: tId, parse_mode: 'Markdown' }));
             try {
@@ -2297,30 +2341,32 @@ async function mulaiBotWhatsApp() {
                 if (call.status === 'ringing') isMasuk = true;
 
                 if (isMasuk) {
+                    const curState = cacheCallState.get(callId);
                     let hasNotif = false;
-                    if (callStateMap[callId]) {
-                        if (callStateMap[callId].notifDering) hasNotif = true;
+                    if (curState) {
+                        if (curState.notifDering) hasNotif = true;
                     }
                     if (hasNotif) continue;
                     
-                    callStateMap[callId] = { startTime: Date.now(), answered: false, notifDering: true };
+                    cacheCallState.set(callId, { startTime: Date.now(), answered: false, notifDering: true });
                     await kirimLogPanggilan(call.from, `📞 *[PANGGILAN ${jenis}${labelGrup} MASUK]*\n👤 Dari: ${info.nama}\n🕒 ${waktuLokal()}`);
                     continue;
                 }
 
                 if (call.status === 'accept') {
+                    const curState = cacheCallState.get(callId);
                     let hasAngkat = false;
-                    if (callStateMap[callId]) {
-                        if (callStateMap[callId].notifDiangkat) hasAngkat = true;
+                    if (curState) {
+                        if (curState.notifDiangkat) hasAngkat = true;
                     }
                     if (hasAngkat) continue;
 
-                    let bState = callStateMap[callId];
+                    let bState = curState;
                     if (!bState) bState = {};
                     bState.answered = true;
                     bState.acceptTime = Date.now();
                     bState.notifDiangkat = true;
-                    callStateMap[callId] = bState;
+                    cacheCallState.set(callId, bState);
 
                     await kirimLogPanggilan(call.from, `📞 *[PANGGILAN DIANGKAT]*\n👤 Dengan: ${info.nama}`);
                     continue;
@@ -2332,8 +2378,8 @@ async function mulaiBotWhatsApp() {
                 if (call.status === 'timeout') isEnd = true;
 
                 if (isEnd) {
-                    const state = callStateMap[callId];
-                    delete callStateMap[callId]; 
+                    const state = cacheCallState.get(callId);
+                    cacheCallState.del(callId); 
 
                     let adaJawab = false;
                     if (state) {
@@ -2367,9 +2413,11 @@ async function mulaiBotWhatsApp() {
             try {
                 await pastikanTopik(event.id);
                 const daftarNama = event.participants.map((p) => ambilInfoKontak(p, null).nama).join(', ');
-                const dictAksi = { add: '➕ Bergabung', remove: '➖ Keluar', promote: '⬆️ Jadi admin', demote: '⬇️ Admin dicabut' };
-                let aksi = dictAksi[event.action];
-                if (!aksi) aksi = event.action;
+                let aksi = event.action;
+                if (event.action === 'add') aksi = '➕ Bergabung';
+                if (event.action === 'remove') aksi = '➖ Keluar';
+                if (event.action === 'promote') aksi = '⬆️ Jadi admin';
+                if (event.action === 'demote') aksi = '⬇️ Admin dicabut';
 
                 await kirimKeTopik({ jid: event.id }, (tId) => tgBot.sendMessage(TG_GROUP_ID, `👥 [GRUP] ${aksi}: ${daftarNama}`, { message_thread_id: tId }));
             } catch (e) {}
@@ -2513,7 +2561,7 @@ async function mulaiBotWhatsApp() {
 }
 
 // =========================================================================
-// EXPRESS SERVER, HEARTBEAT, GARBAGE COLLECTOR & DISK SWEEPER
+// EXPRESS SERVER, HEARTBEAT, GARBAGE COLLECTOR, FORCE OFFLINE INTERVAL
 // =========================================================================
 setInterval(() => { if (global.gc) global.gc(); }, 120000);
 
@@ -2534,6 +2582,17 @@ setInterval(async () => {
         );
     } catch (e) {}
 }, 20000);
+
+// [FORCE OFFLINE ENFORCER] Interval Agresif untuk Mematikan Status "Online"
+setInterval(async () => {
+    if (dbConfig.stealthMode) {
+        if (globalSock) {
+            try {
+                await globalSock.sendPresenceUpdate('unavailable');
+            } catch (e) {}
+        }
+    }
+}, 25000);
 
 const app = express();
 app.get('/', (req, res) => res.send('WA-Tele Bridge Aktif 🚀'));
