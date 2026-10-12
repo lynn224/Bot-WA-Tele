@@ -12,7 +12,8 @@
     "express": "4.21.0",
     "pino": "9.4.0",
     "mongodb": "^6.3.0",
-    "node-cache": "^5.1.2"
+    "node-cache": "^5.1.2", 
+    "telegram": "^2.22.2"
   },
   "engines": {
     "node": ">=18.0.0"
