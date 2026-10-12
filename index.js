@@ -15,6 +15,10 @@ const express = require('express');
 const pino = require('pino');
 const NodeCache = require('node-cache');
 const { MongoClient } = require('mongodb');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { inisialisasiMTProto, uploadBesarMTProto } = require('./mtprotoUploader');
 
 // =========================================================================
 // KONFIGURASI LINGKUNGAN
@@ -22,6 +26,8 @@ const { MongoClient } = require('mongodb');
 const TG_TOKEN = process.env.TG_TOKEN;
 const TG_GROUP_ID = process.env.TG_GROUP_ID;
 const MONGODB_URI = process.env.MONGODB_URI;
+const TG_API_ID = process.env.TG_API_ID;
+const TG_API_HASH = process.env.TG_API_HASH;
 
 if (!TG_TOKEN || !TG_GROUP_ID || !MONGODB_URI) {
     console.error('[FATAL] Pastikan TG_TOKEN, TG_GROUP_ID, MONGODB_URI sudah diset di Environment Variables.');
@@ -53,13 +59,14 @@ tgBot.setMyCommands([
     { command: 'restart', description: 'Restart server bot' }
 ]);
 
-const cacheAntiSpam = new NodeCache({ stdTTL: 3600 });
-const cacheAntiDelete = new NodeCache({ stdTTL: 86400 });
-const cacheDedupProtokol = new NodeCache({ stdTTL: 120 });
-const statusMemory = new NodeCache({ stdTTL: 86400 });
-const msgMapCache = new NodeCache({ stdTTL: 86400 });
-const cacheTgMsgToWaMemori = new NodeCache({ stdTTL: 3 * 86400 });
-const cacheWaMsgToTg = new NodeCache({ stdTTL: 3 * 86400 });
+// OPTIMASI RAM: Penambahan properti maxKeys dan checkperiod untuk cegah Memory Leak
+const cacheAntiSpam = new NodeCache({ stdTTL: 3600, maxKeys: 1500, checkperiod: 600 });
+const cacheAntiDelete = new NodeCache({ stdTTL: 86400, maxKeys: 1500, checkperiod: 600 });
+const cacheDedupProtokol = new NodeCache({ stdTTL: 120, maxKeys: 500 });
+const statusMemory = new NodeCache({ stdTTL: 86400, maxKeys: 1000 });
+const msgMapCache = new NodeCache({ stdTTL: 86400, maxKeys: 2000 });
+const cacheTgMsgToWaMemori = new NodeCache({ stdTTL: 3 * 86400, maxKeys: 2000 });
+const cacheWaMsgToTg = new NodeCache({ stdTTL: 3 * 86400, maxKeys: 2000 });
 
 const withTimeout = (promise, ms, name) => {
     let timeoutId;
@@ -100,6 +107,7 @@ async function ambilPemetaanReply(tgMsgId) {
 let globalSock = null;
 let sedangMenungguPairing = false;
 let sudahMemintaKode = false;
+let isUploadingBigFile = false; // MUTEX LOCK: Cegah antrean file raksasa paralel
 const lastSeenMap = {}; 
 
 let dbConfig = {
@@ -109,7 +117,7 @@ let dbConfig = {
     muted: [],
     nomor_wa_utama: process.env.NOMOR_WA_UTAMA || null,
     pinned_status_msg_id: null,
-    maxMediaMB: 5,
+    maxMediaMB: 2000, // Default bisa sampai 2000MB berkat GramJS
     topicInfoMsgs: {},
     kataKunci: [], 
     blacklistKataKunci: [], 
@@ -237,6 +245,9 @@ async function hubungkanDatabase() {
         delete dbConfig._id;
     }
     await inisialisasiTopikSistem();
+
+    // Inisialisasi GramJS (MTProto)
+    await inisialisasiMTProto(configCollection, TG_API_ID, TG_API_HASH, TG_TOKEN);
 }
 
 async function simpanKonfigurasiDB() {
@@ -830,7 +841,7 @@ async function prosesStatusBroadcast(infoPesan) {
     const statusJidList = contextInfo?.statusJidList || contextInfo?.bcastJidList || [];
     statusMemory.set(infoPesan.key.id, { teks: teksKonten, media: !!pesanMedia, audience: statusJidList, viewers: [] });
     
-    const privasiInfo = isMyOwn ? (statusJidList.length > 0 ? `\n🔒 _Diizinkan dilihat oleh ${statusJidList.length} kontak_` : `\n🔒 _Daftar penerima tidak terbaca_`) : '';
+    const privasiInfo = isMyOwn ? (statusJidList.length > 0 ? `\n🔒 _Status ini diizinkan untuk ${statusJidList.length} kontak_` : `\n🔒 _Daftar izin kontak tidak terbaca_`) : '';
     const caption = `📱 *Status: ${infoPembuat.nama}*\n${teksKonten}${privasiInfo}`;
 
     try {
@@ -852,6 +863,7 @@ async function prosesStatusBroadcast(infoPesan) {
                     tgBot.sendVideo(TG_GROUP_ID, buffer, { ...tgOpts, message_thread_id: tId }, { filename: 'status.mp4', contentType: 'video/mp4' })
                 );
             }
+            if (global.gc) global.gc(); // OPTIMASI: Bebaskan RAM media
         } else {
             hasilStatus = await kirimKeTopik({ sysKey: 'statusWA' }, (tId) => tgBot.sendMessage(TG_GROUP_ID, caption, { message_thread_id: tId, parse_mode: 'Markdown' }));
         }
@@ -889,7 +901,7 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
     
     if (!isiPesan) return; 
 
-    // DETEKSI VIEW-ONCE
+    // REVISI DETEKSI VIEW-ONCE LEBIH AWAL
     let isViewOnce = false;
     if (isiPesan.viewOnceMessage) { isViewOnce = true; isiPesan = isiPesan.viewOnceMessage.message; }
     else if (isiPesan.viewOnceMessageV2) { isViewOnce = true; isiPesan = isiPesan.viewOnceMessageV2.message; }
@@ -914,7 +926,12 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
         else if (isiPesan.videoMessage) jMedia = 'Video';
         else if (isiPesan.audioMessage) jMedia = 'Pesan Suara';
         
-        await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${awalan}👁️ *Pesan Sekali-Lihat (${jMedia})*\n👤 Dari: ${namaPengirimFinal}\nℹ️ _Sesuai proteksi server WhatsApp, pesan ini hanya bisa dibuka langsung di HP utama Anda._`, { message_thread_id: tId, parse_mode: 'Markdown' }));
+        const waktuStamp = infoPesan.messageTimestamp ? infoPesan.messageTimestamp * 1000 : Date.now();
+        const waktuStr = waktuLokal(new Date(waktuStamp));
+
+        const teksVO = `${awalan}👁️ *PESAN SEKALI-LIHAT (${jMedia.toUpperCase()})*\n\n👤 *Dari:* ${namaPengirimFinal}\n🕒 *Waktu:* ${waktuStr}\n\nℹ️ _Sistem keamanan server WhatsApp terbaru telah memblokir pengunduhan jenis pesan ini untuk aplikasi pihak ketiga. Anda hanya bisa membukanya melalui WhatsApp resmi._`;
+        
+        await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, teksVO, { message_thread_id: tId, parse_mode: 'Markdown' }));
         return;
     }
 
@@ -974,6 +991,7 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
             
             // Perbaikan Stiker Bug: Wajib menggunakan mimetype khusus webp
             await kirim((tId) => tgBot.sendSticker(TG_GROUP_ID, buffer, { message_thread_id: tId }, { filename: 'sticker.webp', contentType: 'image/webp' }));
+            if (global.gc) global.gc(); // Bebaskan RAM
         } catch (e) { console.error('[STIKER ERROR]', e.message); }
         return;
     }
@@ -1031,15 +1049,14 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
         if (pesanMedia) {
             const ukuranBytes = parseInt(pesanMedia.fileLength || 0);
             
+            // Limit dari perintah /setmedia pengguna
             if (ukuranBytes > dbConfig.maxMediaMB * 1024 * 1024) {
                 const fallbackGagalBesar = `⚠️ [Media ${Math.round(ukuranBytes/1024/1024)}MB dilewati (Batas: ${dbConfig.maxMediaMB}MB)]`;
-                await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}${awalan}${prefixArah}${quoteBlock}${fallbackGagalBesar}\n💬 ${teksKonten}`, { message_thread_id: tId, parse_mode: 'Markdown' }));
+                const hasilKirim = await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}${awalan}${prefixArah}${quoteBlock}${fallbackGagalBesar}\n💬 ${teksKonten}`, { message_thread_id: tId, parse_mode: 'Markdown' }));
+                await notifikasiMentionDiri(botDiTag, idPengirim, hasilKirim, infoUtama, teksKonten);
                 return;
             }
             
-            // =========================================================================
-            // PERBAIKAN FILE NAME DAN TIPE PENGIRIMAN MEDIA NATIVE TELEGRAM
-            // =========================================================================
             let tipeUnduh = '';
             let namaFileFinal = `media_${infoPesan.key.id}`;
             let mimeTypeFinal = 'application/octet-stream';
@@ -1054,7 +1071,6 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
                 mimeTypeFinal = (isiPesan.videoMessage || isiPesan.ptvMessage).mimetype || 'video/mp4';
             } else if (isiPesan.documentMessage) {
                 tipeUnduh = 'document';
-                // EKSTRAK NAMA FILE ASLI DARI WHATSAPP
                 namaFileFinal = isiPesan.documentMessage.fileName || `dokumen_${infoPesan.key.id}`;
                 mimeTypeFinal = isiPesan.documentMessage.mimetype || 'application/octet-stream';
             } else if (isiPesan.audioMessage) {
@@ -1065,54 +1081,105 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
             }
 
             try {
-                const stream = await downloadContentFromMessage(pesanMedia, tipeUnduh);
-                let buffer = Buffer.alloc(0);
-                for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
-
                 const teksCaption = `${tagNotice}${awalan}${prefixArah}${quoteBlock}${teksKonten}`;
                 const tgOpts = { caption: teksCaption, parse_mode: 'Markdown' };
                 const fileOpts = { filename: namaFileFinal, contentType: mimeTypeFinal };
 
                 let hasilKirim;
+                
+                // INTEGRASI DUAL-ENGINE: Ambang batas 49 MB
+                const isMediaRaksasa = ukuranBytes > 49 * 1024 * 1024;
 
-                // Menggunakan Metode Native Telegram agar file render sempurna
-                if (tipeUnduh === 'image') {
-                    hasilKirim = await kirim((tId) => tgBot.sendPhoto(TG_GROUP_ID, buffer, { ...tgOpts, message_thread_id: tId }, fileOpts));
-                } else if (tipeUnduh === 'video') {
-                    hasilKirim = await kirim((tId) => tgBot.sendVideo(TG_GROUP_ID, buffer, { ...tgOpts, message_thread_id: tId }, fileOpts));
-                } else if (tipeUnduh === 'audio') {
-                    if (isiPesan.audioMessage.ptt) { // Voice Note WA
-                        hasilKirim = await kirim((tId) => tgBot.sendVoice(TG_GROUP_ID, buffer, { ...tgOpts, message_thread_id: tId }, fileOpts));
-                    } else { // Lagu / MP3 Biasa
-                        hasilKirim = await kirim((tId) => tgBot.sendAudio(TG_GROUP_ID, buffer, { ...tgOpts, message_thread_id: tId }, fileOpts));
+                if (isMediaRaksasa) {
+                    // MENGGUNAKAN MTPROTO
+                    // MUTEX LOCK: Tunggu jika ada file besar lain yang sedang diunggah
+                    while (isUploadingBigFile) { 
+                        await delay(2000); 
+                    }
+                    isUploadingBigFile = true;
+                    
+                    const tempFilePath = path.join(os.tmpdir(), namaFileFinal);
+                    let notifTunggu = null;
+
+                    try {
+                        const writeStream = fs.createWriteStream(tempFilePath);
+                        notifTunggu = await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `⏳ *Menarik file raksasa dari WA...* (${Math.round(ukuranBytes/1024/1024)} MB)`, { message_thread_id: tId, parse_mode: 'Markdown' }));
+
+                        const stream = await downloadContentFromMessage(pesanMedia, tipeUnduh);
+                        for await (const chunk of stream) {
+                            writeStream.write(chunk);
+                        }
+                        writeStream.end();
+                        await new Promise(resolve => writeStream.on('finish', resolve));
+
+                        if (notifTunggu) {
+                            await safeTG(() => tgBot.editMessageText(`🚀 *Meneruskan file ke Telegram via MTProto...*`, { chat_id: TG_GROUP_ID, message_id: notifTunggu.message_id, parse_mode: 'Markdown' }));
+                        }
+
+                        hasilKirim = await kirim(async (tId) => {
+                            return await uploadBesarMTProto(tempFilePath, namaFileFinal, mimeTypeFinal, teksCaption, TG_GROUP_ID, tId);
+                        });
+                    } finally {
+                        // Bersihkan disk
+                        if (fs.existsSync(tempFilePath)) fs.unlinkSync(tempFilePath);
+                        if (notifTunggu) await safeTG(() => tgBot.deleteMessage(TG_GROUP_ID, notifTunggu.message_id).catch(()=>{}));
+                        isUploadingBigFile = false; // Buka kunci mutex
+                        if (global.gc) global.gc(); // Panggil GC instan
                     }
                 } else {
-                    // Dokumen (Excel, Word, PDF, RAR, dll) dengan Nama Asli & Ekstensi utuh
-                    hasilKirim = await kirim((tId) => tgBot.sendDocument(TG_GROUP_ID, buffer, { ...tgOpts, message_thread_id: tId }, fileOpts));
+                    // MENGGUNAKAN BOT API BIASA
+                    const stream = await downloadContentFromMessage(pesanMedia, tipeUnduh);
+                    let buffer = Buffer.alloc(0);
+                    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+
+                    if (tipeUnduh === 'image') {
+                        hasilKirim = await kirim((tId) => tgBot.sendPhoto(TG_GROUP_ID, buffer, { ...tgOpts, message_thread_id: tId }, fileOpts));
+                    } else if (tipeUnduh === 'video') {
+                        hasilKirim = await kirim((tId) => tgBot.sendVideo(TG_GROUP_ID, buffer, { ...tgOpts, message_thread_id: tId }, fileOpts));
+                    } else if (tipeUnduh === 'audio') {
+                        if (isiPesan.audioMessage.ptt) {
+                            hasilKirim = await kirim((tId) => tgBot.sendVoice(TG_GROUP_ID, buffer, { ...tgOpts, message_thread_id: tId }, fileOpts));
+                        } else { 
+                            hasilKirim = await kirim((tId) => tgBot.sendAudio(TG_GROUP_ID, buffer, { ...tgOpts, message_thread_id: tId }, fileOpts));
+                        }
+                    } else {
+                        hasilKirim = await kirim((tId) => tgBot.sendDocument(TG_GROUP_ID, buffer, { ...tgOpts, message_thread_id: tId }, fileOpts));
+                    }
+                    if (global.gc) global.gc(); // Panggil GC
                 }
 
                 await cekKataKunci(idPengirim, isFromMe, isHistory, namaPengirimFinal, teksKonten, hasilKirim);
-                await notifikasiMentionDiri(botDiTag, idPengirim, hasilKirim);
+                await notifikasiMentionDiri(botDiTag, idPengirim, hasilKirim, infoUtama, teksKonten || '[Media]');
             } catch (dlErr) {
                 const fallbackGagal = `⚠️ [Sistem gagal mengunduh media dari WA]`;
-                await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}${awalan}${prefixArah}${quoteBlock}${fallbackGagal}\n💬 ${teksKonten}`, { message_thread_id: tId, parse_mode: 'Markdown' }));
+                const hasilKirim = await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}${awalan}${prefixArah}${quoteBlock}${fallbackGagal}\n💬 ${teksKonten}`, { message_thread_id: tId, parse_mode: 'Markdown' }));
+                await notifikasiMentionDiri(botDiTag, idPengirim, hasilKirim, infoUtama, teksKonten || '[Gagal unduh media]');
             }
         } else if (teksKonten.trim() !== '') {
             const hasilKirim = await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, `${tagNotice}${awalan}${prefixArah}${quoteBlock}💬 ${teksKonten}`, { message_thread_id: tId, parse_mode: 'Markdown' }));
             await cekKataKunci(idPengirim, isFromMe, isHistory, namaPengirimFinal, teksKonten, hasilKirim);
-            await notifikasiMentionDiri(botDiTag, idPengirim, hasilKirim);
+            await notifikasiMentionDiri(botDiTag, idPengirim, hasilKirim, infoUtama, teksKonten);
         }
     } catch (e) { console.error('[TG SEND ERROR]', e.message); }
 }
 
-async function notifikasiMentionDiri(botDiTag, idPengirim, hasilKirim) {
+// FITUR BARU: Notifikasi Deep-Link Mention
+async function notifikasiMentionDiri(botDiTag, idPengirim, hasilKirim, infoUtama, teksKonten) {
     if (!botDiTag || !hasilKirim?.message_id) return;
     const threadId = dbConfig.topik[idPengirim];
     if (!threadId) return;
+    
     const groupIdBersih = TG_GROUP_ID.toString().replace('-100', '');
     const link = `https://t.me/c/${groupIdBersih}/${threadId}/${hasilKirim.message_id}`;
+    
+    let asalInfo = infoUtama.nama;
+    if (infoUtama.isGrup) asalInfo = `Grup ${infoUtama.nama}`;
+    const snippet = teksKonten.length > 60 ? teksKonten.substring(0, 60) + '...' : teksKonten;
+
     await kirimKeTopik({ sysKey: 'aktivitas' }, (tId) => tgBot.sendMessage(TG_GROUP_ID,
-        `🔔 *Nomor Anda di-mention!*\n🔗 [Lihat Pesan](${link})`, { message_thread_id: tId, parse_mode: 'Markdown' }));
+        `🔔 *NOMOR ANDA DI-TAG / MENTION!*\n\n📍 *Lokasi:* ${asalInfo}\n💬 *Pesan:* "_${snippet}_"\n\n[👉 Buka Pesan di Topik](${link})`, 
+        { message_thread_id: tId, parse_mode: 'Markdown' })
+    );
 }
 
 async function cekKataKunci(idPengirim, isFromMe, isHistory, namaPengirim, teksKonten, hasilKirim) {
@@ -1126,7 +1193,7 @@ async function cekKataKunci(idPengirim, isFromMe, isHistory, namaPengirim, teksK
     let tautan = '';
     if (hasilKirim?.message_id && dbConfig.topik[idPengirim]) {
         const groupIdBersih = TG_GROUP_ID.toString().replace('-100', '');
-        tautan = `\n🔗 [Lihat Pesan](https://t.me/c/${groupIdBersih}/${dbConfig.topik[idPengirim]}/${hasilKirim.message_id})`;
+        tautan = `\n\n[👉 Buka Pesan di Topik](https://t.me/c/${groupIdBersih}/${dbConfig.topik[idPengirim]}/${hasilKirim.message_id})`;
     }
 
     await kirimKeTopik({ sysKey: 'kataKunci' }, (tId) => tgBot.sendMessage(TG_GROUP_ID,
@@ -1171,10 +1238,16 @@ async function mulaiBotWhatsApp() {
             let changed = false;
             for (const c of contacts) {
                 const nama = c.name || c.notify;
-                if (c.lid && c.id) { dbConfig.lidMap[c.lid] = c.id; changed = true; }
+                if (c.lid && c.id) {
+                    dbConfig.lidMap[c.lid] = c.id;
+                    changed = true;
+                }
                 if (nama) {
                     if (c.id) await renameTopikJikaPerlu(c.id, nama, false);
-                    if (c.lid) { dbConfig.kontak[c.lid] = nama; await renameTopikJikaPerlu(c.lid, nama, false); }
+                    if (c.lid) {
+                        dbConfig.kontak[c.lid] = nama;
+                        await renameTopikJikaPerlu(c.lid, nama, false);
+                    }
                     changed = true;
                 }
             }
@@ -1185,10 +1258,16 @@ async function mulaiBotWhatsApp() {
             let changed = false;
             for (const c of updates) {
                 const nama = c.name || c.notify;
-                if (c.lid && c.id) { dbConfig.lidMap[c.lid] = c.id; changed = true; }
+                if (c.lid && c.id) {
+                    dbConfig.lidMap[c.lid] = c.id;
+                    changed = true;
+                }
                 if (nama) {
                     if (c.id) await renameTopikJikaPerlu(c.id, nama, false);
-                    if (c.lid) { dbConfig.kontak[c.lid] = nama; await renameTopikJikaPerlu(c.lid, nama, false); }
+                    if (c.lid) {
+                        dbConfig.kontak[c.lid] = nama;
+                        await renameTopikJikaPerlu(c.lid, nama, false);
+                    }
                     changed = true;
                 }
             }
@@ -1202,8 +1281,11 @@ async function mulaiBotWhatsApp() {
                 if (g.participants) {
                     for (const p of g.participants) {
                         if (p.lid && p.id && !dbConfig.lidMap[p.lid]) {
-                            dbConfig.lidMap[p.lid] = p.id; changed = true;
-                            if (dbConfig.topik[p.lid]) await renameTopikJikaPerlu(p.lid, dbConfig.kontak[p.lid] || p.id.split('@')[0], false);
+                            dbConfig.lidMap[p.lid] = p.id;
+                            changed = true;
+                            if (dbConfig.topik[p.lid]) {
+                                await renameTopikJikaPerlu(p.lid, dbConfig.kontak[p.lid] || p.id.split('@')[0], false);
+                            }
                         }
                     }
                 }
@@ -1410,14 +1492,20 @@ async function mulaiBotWhatsApp() {
 
         sock.ev.on('messages.update', async (updates) => {
             for (const update of updates) {
+                // TRACKER STATUS
                 if (update.key.remoteJid === 'status@broadcast' && update.update.status === 4) {
                     const info = ambilInfoKontak(update.key.participant, null);
                     const statMem = statusMemory.get(update.key.id);
-                    if (statMem) {
-                        if (!statMem.viewers.includes(update.key.participant)) statMem.viewers.push(update.key.participant);
+                    if (statMem && !statMem.viewers.includes(update.key.participant)) {
+                        statMem.viewers.push(update.key.participant);
                         statusMemory.set(update.key.id, statMem);
+                        
+                        const totalAllowed = statMem.audience?.length || 0;
+                        const totalViewed = statMem.viewers.length;
+                        const ratioText = totalAllowed > 0 ? `(${totalViewed} dari ${totalAllowed} yang diizinkan)` : `(${totalViewed} penonton)`;
+                        
+                        kirimKeTopik({ sysKey: 'statusWA' }, (tId) => tgBot.sendMessage(TG_GROUP_ID, `👀 *${info.nama}* baru saja melihat status Anda ${ratioText}:\n👉 _"${statMem.teks || 'Media'}"_`, { message_thread_id: tId, parse_mode: 'Markdown' }));
                     }
-                    kirimKeTopik({ sysKey: 'statusWA' }, (tId) => tgBot.sendMessage(TG_GROUP_ID, `👀 *${info.nama}* melihat status:\n👉 _"${statMem?.teks || 'Media'}"_`, { message_thread_id: tId, parse_mode: 'Markdown' }));
                     continue;
                 }
 
@@ -1431,7 +1519,9 @@ async function mulaiBotWhatsApp() {
                     }
                 }
 
-                if (update.update.protocolMessage) await prosesProtokolPesan(update.update.protocolMessage, update.key.participant);
+                if (update.update.protocolMessage) {
+                    await prosesProtokolPesan(update.update.protocolMessage, update.key.participant);
+                }
             }
         });
 
@@ -1440,6 +1530,12 @@ async function mulaiBotWhatsApp() {
         sock.ev.on('messages.upsert', async (chatUpdate) => {
             const infoPesan = chatUpdate.messages[0];
             if (!infoPesan || !infoPesan.message) return;
+
+            const idPesan = infoPesan.key.id;
+            
+            // KUNCI OPTIMASI RAM: Filter AntiSpam lebih awal agar tidak memakan CPU/RAM ekstra
+            if (cacheAntiSpam.has(idPesan)) return;
+            cacheAntiSpam.set(idPesan, true);
 
             const pushName = infoPesan.pushName || 'Kontak';
             const jid = infoPesan.key.remoteJid;
@@ -1455,8 +1551,6 @@ async function mulaiBotWhatsApp() {
                 if (!sedangMemprosesAntrean) jalankanPekerjaAntrean();
                 return;
             }
-
-            const idPesan = infoPesan.key.id;
             
             let isiPesan = infoPesan.message;
             if (isiPesan?.ephemeralMessage) isiPesan = isiPesan.ephemeralMessage.message;
@@ -1470,8 +1564,6 @@ async function mulaiBotWhatsApp() {
                 return;
             }
 
-            if (cacheAntiSpam.has(idPesan)) return;
-            cacheAntiSpam.set(idPesan, true);
             masukAntrean(infoPesan, pushName, false);
         });
     } catch (err) {
@@ -1481,7 +1573,7 @@ async function mulaiBotWhatsApp() {
 }
 
 // =========================================================================
-// EXPRESS SERVER, HEARTBEAT, GARBAGE COLLECTOR
+// EXPRESS SERVER, HEARTBEAT, GARBAGE COLLECTOR & DISK SWEEPER
 // =========================================================================
 setInterval(() => { if (global.gc) global.gc(); }, 120000);
 
@@ -1513,9 +1605,23 @@ process.on('SIGTERM', async () => {
     process.exit(0);
 });
 
+// DISK SWEEPER OTOMATIS
+function bersihkanTempMedia() {
+    const tmp = os.tmpdir();
+    fs.readdirSync(tmp).forEach(file => {
+        if (file.startsWith('media_') || file.startsWith('foto_') || file.startsWith('video_') || file.startsWith('dokumen_') || file.startsWith('audio_') || file.startsWith('status.')) {
+            try { 
+                fs.unlinkSync(path.join(tmp, file)); 
+                console.log(`[Disk Sweeper] Sisa file lama dihapus: ${file}`); 
+            } catch (e) {}
+        }
+    });
+}
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🌐 Web server aktif di port ${PORT}.`);
+    bersihkanTempMedia();
     inisialisasiDenganRetry();
 });
 
