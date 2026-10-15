@@ -18,7 +18,10 @@ const { MongoClient } = require('mongodb');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+
+// MEMANGGIL MODUL MANDIRI
 const { inisialisasiMTProto, uploadBesarMTProto } = require('./mtprotoUploader');
+const stealthEngine = require('./stealth');
 
 // =========================================================================
 // KONFIGURASI LINGKUNGAN
@@ -40,7 +43,8 @@ if (envMissing) {
 }
 
 const HISTORY_SYNC_DELAY_MS = 15 * 60 * 1000;
-const ZONA_WAKTU = process.env.TIMEZONE ? process.env.TIMEZONE : 'Asia/Jakarta'; 
+let ZONA_WAKTU = 'Asia/Jakarta';
+if (process.env.TIMEZONE) ZONA_WAKTU = process.env.TIMEZONE; 
 
 function waktuLokal(date = new Date()) {
     return date.toLocaleString('id-ID', { timeZone: ZONA_WAKTU });
@@ -56,6 +60,7 @@ tgBot.setMyCommands([
     { command: 'help', description: 'Daftar perintah' },
     { command: 'status', description: 'Cek RAM & koneksi' },
     { command: 'stealth', description: 'Aktif/nonaktifkan mode stealth (on/off)' },
+    { command: 'centangbiru', description: 'Ubah pesan target jadi centang biru' },
     { command: 'setmedia', description: 'Atur batas ukuran media (MB)' },
     { command: 'mystatus', description: 'Laporan viewer status Anda' },
     { command: 'info', description: 'Detail kontak topik ini' },
@@ -65,6 +70,7 @@ tgBot.setMyCommands([
     { command: 'restart', description: 'Restart server bot' }
 ]);
 
+// CACHE BERBATAS
 const cacheAntiSpam = new NodeCache({ stdTTL: 3600, maxKeys: 1500, checkperiod: 600 });
 const cacheAntiDelete = new NodeCache({ stdTTL: 86400, maxKeys: 1500, checkperiod: 600 });
 const cacheDedupProtokol = new NodeCache({ stdTTL: 120, maxKeys: 500 });
@@ -72,16 +78,14 @@ const statusMemory = new NodeCache({ stdTTL: 86400, maxKeys: 1000 });
 const msgMapCache = new NodeCache({ stdTTL: 86400, maxKeys: 2000 });
 const cacheTgMsgToWaMemori = new NodeCache({ stdTTL: 3 * 86400, maxKeys: 2000 });
 const cacheWaMsgToTg = new NodeCache({ stdTTL: 3 * 86400, maxKeys: 2000 });
-
+const cacheLastMsg = new NodeCache({ stdTTL: 86400, maxKeys: 2000 });
 const cacheLastSeen = new NodeCache({ stdTTL: 7 * 86400, maxKeys: 2000 });
 const cacheCurrentStatus = new NodeCache({ stdTTL: 2 * 86400, maxKeys: 2000 });
 const cacheCallState = new NodeCache({ stdTTL: 3600, maxKeys: 300 });
 
 async function streamKeBuffer(stream) {
     const chunks = [];
-    for await (const chunk of stream) {
-        chunks.push(chunk);
-    }
+    for await (const chunk of stream) chunks.push(chunk);
     return Buffer.concat(chunks);
 }
 
@@ -134,7 +138,7 @@ let dbConfig = {
     kontak: {},
     sysTopics: {},
     muted: [],
-    nomor_wa_utama: process.env.NOMOR_WA_UTAMA ? process.env.NOMOR_WA_UTAMA : null,
+    nomor_wa_utama: null,
     pinned_status_msg_id: null,
     maxMediaMB: 2000,
     topicInfoMsgs: {},
@@ -144,6 +148,10 @@ let dbConfig = {
     stealthMode: true,
     lidMap: {} 
 };
+
+if (process.env.NOMOR_WA_UTAMA) {
+    dbConfig.nomor_wa_utama = process.env.NOMOR_WA_UTAMA;
+}
 
 let statusHpSaatIni = 'Menghubungkan...';
 let sedangMemprosesAntrean = false;
@@ -163,7 +171,8 @@ async function safeTG(apiCall) {
             }
             if (isRateLimit) {
                 const matched = e.message.match(/retry after (\d+)/);
-                const waitStr = matched ? matched[1] : '30';
+                let waitStr = '30';
+                if (matched) waitStr = matched[1];
                 const wait = parseInt(waitStr, 10);
                 console.log(`[TG RATE LIMIT] Menunggu ${wait + 1} detik...`);
                 await delay((wait + 1) * 1000);
@@ -179,14 +188,21 @@ async function safeTG(apiCall) {
 function parseVCard(vcardText) {
     if (!vcardText) return null;
     const namaMatch = vcardText.match(/FN:(.+)/);
-    const nama = namaMatch ? namaMatch[1].trim() : null;
-    const nomorList = [...vcardText.matchAll(/TEL[^:]*:([+()\d\s-]+)/g)].map((m) => m[1].replace(/[^\d]/g, '')).filter(Boolean);
+    let nama = null;
+    if (namaMatch) nama = namaMatch[1].trim();
+    
+    const nomorList = [...vcardText.matchAll(/TEL[^:]*:([+()\d\s-]+)/g)].map((m) => m[1].replace(/[^\d]/g, '')).filter((x) => {
+        let ok = true;
+        if (!x) ok = false;
+        return ok;
+    });
+    
     let noData = false;
     if (!nama) {
         if (nomorList.length === 0) noData = true;
     }
     if (noData) return null;
-    return { nama, nomorList };
+    return { nama: nama, nomorList: nomorList };
 }
 
 async function setTGReaksi(msgId, emoji) {
@@ -210,8 +226,9 @@ function isErrorTopikBasi(pesanError) {
 }
 
 async function kirimKeTopik({ jid, sysKey }, kirimFn) {
-    const ambilThreadIdSaatIni = () => (sysKey ? dbConfig.sysTopics[sysKey] : dbConfig.topik[jid]);
-    const threadId = ambilThreadIdSaatIni();
+    let threadId = null;
+    if (sysKey) threadId = dbConfig.sysTopics[sysKey];
+    else threadId = dbConfig.topik[jid];
 
     try {
         return await kirimFn(threadId);
@@ -220,7 +237,8 @@ async function kirimKeTopik({ jid, sysKey }, kirimFn) {
             console.error('[TG ERROR]', e.message);
             return null;
         }
-        const identitas = sysKey ? sysKey : jid;
+        let identitas = jid;
+        if (sysKey) identitas = sysKey;
         console.log(`[TOPIK STALE] Thread ${threadId} tidak valid lagi (${identitas}), membuat ulang...`);
 
         try {
@@ -239,11 +257,13 @@ async function kirimKeTopik({ jid, sysKey }, kirimFn) {
             return null;
         }
 
-        const threadIdBaru = ambilThreadIdSaatIni();
-        if (!threadIdBaru) return null;
+        if (sysKey) threadId = dbConfig.sysTopics[sysKey];
+        else threadId = dbConfig.topik[jid];
+
+        if (!threadId) return null;
 
         try {
-            return await kirimFn(threadIdBaru);
+            return await kirimFn(threadId);
         } catch (e3) {
             console.error('[TOPIK RETRY GAGAL]', e3.message);
             return null;
@@ -332,8 +352,11 @@ async function useMongoDBAuthState() {
 function ambilInfoKontak(jid, pushNameFallback) {
     if (!jid) return { nama: 'Unknown', nomor: 'Unknown', isLid: false, isGrup: false };
     
-    const isLid = jid.includes('@lid');
-    const isGrup = jid.endsWith('@g.us');
+    let isLid = false;
+    if (jid.includes('@lid')) isLid = true;
+    
+    let isGrup = false;
+    if (jid.endsWith('@g.us')) isGrup = true;
 
     let targetPnJid = jid;
     if (isLid) {
@@ -370,9 +393,12 @@ function ambilInfoKontak(jid, pushNameFallback) {
         if (isLid) isRahasia = true;
     }
 
+    let num = nomorAsli;
+    if (isRahasia) num = 'Disembunyikan (LID)';
+
     return { 
         nama: nama, 
-        nomor: isRahasia ? 'Disembunyikan (LID)' : nomorAsli, 
+        nomor: num, 
         isLid: isLid, 
         isGrup: isGrup,
         pnJid: targetPnJid
@@ -399,7 +425,10 @@ async function prosesProtokolPesan(protoMsg, jidPelaku) {
         if (!isEdit) return;
     }
 
-    const dedupKey = (isHapus ? 'hapus' : 'edit') + '-' + idTarget;
+    let pSfx = 'edit';
+    if (isHapus) pSfx = 'hapus';
+
+    const dedupKey = pSfx + '-' + idTarget;
     if (cacheDedupProtokol.has(dedupKey)) return; 
     cacheDedupProtokol.set(dedupKey, true);
 
@@ -407,7 +436,11 @@ async function prosesProtokolPesan(protoMsg, jidPelaku) {
 
     const dataAsli = cacheAntiDelete.get(idTarget);
     
-    let namaPengirim = dataAsli?.pengirim;
+    let namaPengirim = null;
+    if (dataAsli) {
+        if (dataAsli.pengirim) namaPengirim = dataAsli.pengirim;
+    }
+
     if (!namaPengirim) {
         if (jidPelaku) namaPengirim = ambilInfoKontak(jidPelaku, null).nama;
         else namaPengirim = ambilInfoKontak(jidChat, null).nama;
@@ -429,7 +462,7 @@ async function prosesProtokolPesan(protoMsg, jidPelaku) {
         }
     }
 
-    let note;
+    let note = '';
     if (isHapus) {
         let isiHapus = "(media, isi tidak tercatat)";
         if (dataAsli) {
@@ -437,8 +470,17 @@ async function prosesProtokolPesan(protoMsg, jidPelaku) {
         }
         note = `🗑️ *Pesan Dihapus*\n👤 Dari: ${namaPengirim}\n💬 Isi pesan: "${isiHapus}"${linkAsli}`;
     } else {
-        let teksBaru = protoMsg.editedMessage?.conversation;
-        if (!teksBaru) teksBaru = protoMsg.editedMessage?.extendedTextMessage?.text;
+        let teksBaru = null;
+        if (protoMsg.editedMessage) {
+            if (protoMsg.editedMessage.conversation) teksBaru = protoMsg.editedMessage.conversation;
+        }
+        if (!teksBaru) {
+            if (protoMsg.editedMessage) {
+                if (protoMsg.editedMessage.extendedTextMessage) {
+                    if (protoMsg.editedMessage.extendedTextMessage.text) teksBaru = protoMsg.editedMessage.extendedTextMessage.text;
+                }
+            }
+        }
         if (!teksBaru) teksBaru = '(media/tidak terbaca)';
 
         let isiLama = "(tidak tercatat)";
@@ -478,7 +520,8 @@ async function inisialisasiTopikSistem() {
 async function pastikanTopik(jid, pushName) {
     if (dbConfig.topik[jid]) return dbConfig.topik[jid];
 
-    const isGrup = jid.endsWith('@g.us');
+    let isGrup = false;
+    if (jid.endsWith('@g.us')) isGrup = true;
     
     if (isGrup) {
         if (globalSock) {
@@ -521,7 +564,10 @@ async function pastikanTopik(jid, pushName) {
     }
 
     const info = ambilInfoKontak(jid, pushName);
-    let namaFolder = info.isGrup ? '👥 GRUP: ' + info.nama : '👤 ' + info.nama;
+    let namaFolder = info.nama;
+    if (info.isGrup) namaFolder = '👥 GRUP: ' + info.nama;
+    else namaFolder = '👤 ' + info.nama;
+
     if (info.nomor !== 'Disembunyikan (LID)') {
         if (!info.isGrup) {
             namaFolder += ' (' + info.nomor + ')';
@@ -538,7 +584,9 @@ async function pastikanTopik(jid, pushName) {
     dbConfig.topik[jid] = result.message_thread_id;
 
     if (!info.isGrup) {
-        const displayNum = info.nomor === 'Disembunyikan (LID)' ? 'Nomor Disembunyikan (LID)' : `+${info.nomor}`;
+        let displayNum = `+${info.nomor}`;
+        if (info.nomor === 'Disembunyikan (LID)') displayNum = 'Nomor Disembunyikan (LID)';
+        
         const infoMsg = await safeTG(() => tgBot.sendMessage(TG_GROUP_ID,
             `ℹ️ *INFO KONTAK*\nNama: ${info.nama}\nNomor:${displayNum}\nStatus: 🔴 Offline`,
             { message_thread_id: result.message_thread_id, parse_mode: 'Markdown' }));
@@ -560,7 +608,10 @@ async function renameTopikJikaPerlu(jid, namaBaru, isGrup) {
     const threadId = dbConfig.topik[jid];
     if (!threadId) return;
 
-    let namaTopikBaru = isGrup ? '👥 GRUP: ' + namaBaru : '👤 ' + namaBaru;
+    let namaTopikBaru = namaBaru;
+    if (isGrup) namaTopikBaru = '👥 GRUP: ' + namaBaru;
+    else namaTopikBaru = '👤 ' + namaBaru;
+
     const info = ambilInfoKontak(jid, null);
     if (info.nomor !== 'Disembunyikan (LID)') {
         if (!isGrup) {
@@ -595,7 +646,9 @@ async function perbaruiStatusTelegram(statusBaru, paksa = false) {
 
     statusHpSaatIni = statusBaru;
 
-    const statusStealth = dbConfig.stealthMode ? '🟢 AKTIF (Hantu)' : '🔴 NONAKTIF';
+    let statusStealth = '🔴 NONAKTIF';
+    if (dbConfig.stealthMode) statusStealth = '🟢 AKTIF (Hantu)';
+
     let teksStatus = `🖥️ *COMMAND CENTER*\n\n📱 Koneksi WA: *${statusBaru}*\n🕶️ Mode Stealth: *${statusStealth}*\n📁 Batas Media: ${dbConfig.maxMediaMB} MB\n📦 Antrean: ${antreanPesan.length} pesan +${antreanStatus.length} story`;
     if (sedangSinkronisasi) teksStatus += `\n⏳ Sinkronisasi riwayat berjalan...`;
 
@@ -647,10 +700,11 @@ tgBot.on('message', async (msg) => {
     let cmd = args[0].split('@')[0];
     cmd = cmd.toLowerCase();
 
+    const userMsgId = msg.message_id;
     const jadwalkanHapusPerintah = (idBalasan) => {
         if (!cmd.startsWith('/')) return; 
         setTimeout(async () => {
-            try { await tgBot.deleteMessage(TG_GROUP_ID, msg.message_id); } catch (e) {}
+            try { await tgBot.deleteMessage(TG_GROUP_ID, userMsgId); } catch (e) {}
             if (idBalasan) { try { await tgBot.deleteMessage(TG_GROUP_ID, idBalasan); } catch (e) {} }
         }, DURASI_AUTO_HAPUS_PERINTAH);
     };
@@ -666,7 +720,7 @@ tgBot.on('message', async (msg) => {
     };
 
     if (cmd === '/help') {
-        const help = `🛠️ *MENU COMMAND*\n\n*Umum* (di 📌 Perintah Bot):\n/status - Diagnostik server\n/stealth [on/off] - Mode hantu\n/setmedia [MB] - Set batas media\n/mystatus - Laporan viewer status Anda\n/online - Status online semua kontak\n/restart - Restart bot\n/login [nomor] - Tautkan nomor WA\n\n*Kata Kunci*:\n/addkata, /listkata, /delkata, /blacklistkata, /unblacklistkata\n\n*Status WA*:\n/nostatus, /yesstatus, /liststatus\n\n*Topik Kontak*:\n/info, /mute, /unmute, /hapustopik\n\n*Lainnya*:\n/hapussemuatopik konfirmasi - Hapus semua topik\n\n💬 Ketik langsung di topik untuk kirim pesan. Pakai Reply Telegram untuk membalas pesan spesifik.`;
+        const help = `🛠️ *MENU COMMAND*\n\n*Umum* (di 📌 Perintah Bot):\n/status - Diagnostik server\n/stealth [on/off] - Mode hantu\n/centangbiru - Ubah pesan target jadi centang biru\n/setmedia [MB] - Set batas media\n/mystatus - Laporan viewer status Anda\n/online - Status online semua kontak\n/restart - Restart bot\n/login [nomor] - Tautkan nomor WA\n\n*Kata Kunci*:\n/addkata, /listkata, /delkata, /blacklistkata, /unblacklistkata\n\n*Status WA*:\n/nostatus, /yesstatus, /liststatus\n\n*Topik Kontak*:\n/info, /mute, /unmute, /hapustopik\n\n*Lainnya*:\n/hapussemuatopik konfirmasi - Hapus semua topik\n\n💬 Ketik langsung di topik untuk kirim pesan. Pakai Reply Telegram untuk membalas pesan spesifik.`;
         return balasPerintah(help, { parse_mode: 'Markdown' });
     }
 
@@ -702,6 +756,17 @@ tgBot.on('message', async (msg) => {
         return balasPerintah(replyText, { parse_mode: 'Markdown' });
     }
 
+    if (cmd === '/centangbiru') {
+        if (!targetJid) return balasPerintah(`⚠️ Gunakan di dalam topik kontak.`);
+        if (!globalSock) return balasPerintah(`⚠️ Socket terputus.`);
+        try {
+            await stealthEngine.paksaCentangBiru(globalSock, targetJid, cacheLastMsg);
+            return balasPerintah(`✅ Status pesan terakhir telah diubah menjadi *Centang Biru (Dibaca)*.`, { parse_mode: 'Markdown' });
+        } catch (e) {
+            return balasPerintah(`❌ Gagal: ${e.message}`);
+        }
+    }
+
     if (cmd === '/stealth') {
         let arg = '';
         if (args[1]) arg = args[1];
@@ -709,9 +774,7 @@ tgBot.on('message', async (msg) => {
         
         if (arg === 'on') {
             dbConfig.stealthMode = true;
-            if (globalSock) {
-                try { await globalSock.sendPresenceUpdate('unavailable'); } catch (e) {}
-            }
+            await stealthEngine.tembakOfflineJIT(globalSock, dbConfig);
         } else if (arg === 'off') {
             dbConfig.stealthMode = false;
         } else {
@@ -719,7 +782,10 @@ tgBot.on('message', async (msg) => {
         }
         await simpanKonfigurasiDB();
         perbaruiStatusTelegram(statusHpSaatIni, true);
-        return balasPerintah(`✅ Mode Stealth: *${dbConfig.stealthMode ? 'AKTIF' : 'NONAKTIF'}*`, { parse_mode: 'Markdown' });
+        
+        let tSt = 'NONAKTIF';
+        if (dbConfig.stealthMode) tSt = 'AKTIF';
+        return balasPerintah(`✅ Mode Stealth: *${tSt}*`, { parse_mode: 'Markdown' });
     }
 
     if (cmd === '/setmedia') {
@@ -950,6 +1016,7 @@ tgBot.on('message', async (msg) => {
     if (cmd === '/unblacklistkata') isCmdContactOnly = true;
     if (cmd === '/nostatus') isCmdContactOnly = true;
     if (cmd === '/yesstatus') isCmdContactOnly = true;
+    if (cmd === '/centangbiru') isCmdContactOnly = true;
 
     if (teks.startsWith('/')) {
         if (isCmdContactOnly) {
@@ -992,7 +1059,6 @@ tgBot.on('message', async (msg) => {
         if (globalSock) {
             if (!teks.startsWith('/')) {
                 
-                // Mencegah 'Sedang Mengetik' bocor ke WA jika stealth aktif
                 if (!dbConfig.stealthMode) {
                     try {
                         await globalSock.sendPresenceUpdate('composing', targetJid);
@@ -1054,9 +1120,8 @@ tgBot.on('message', async (msg) => {
                     const sent = await globalSock.sendMessage(targetJid, msgOptions, opsiKirim);
                     msgMapCache.set(sent.key.id, { tgMsgId: msg.message_id, threadId: threadId });
 
-                    if (dbConfig.stealthMode) {
-                        try { await globalSock.sendPresenceUpdate('unavailable'); } catch (e) {}
-                    }
+                    // Tembak Offline JIT setelah mengirim pesan
+                    await stealthEngine.tembakOfflineJIT(globalSock, dbConfig);
                 } catch (e) {
                     await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal kirim: ${e.message}`, { message_thread_id: threadId }));
                 }
@@ -1082,7 +1147,9 @@ tgBot.on('message_reaction', async (reaction) => {
     
     try {
         await globalSock.sendMessage(target.waJid, { react: { text: emojiBaru, key: target.waMsg.key } });
-    } catch (e) {}
+    } catch (e) {
+        console.error('[REACT KE WA ERROR]', e.message);
+    }
 });
 
 // =========================================================================
@@ -1152,7 +1219,7 @@ async function jalankanPekerjaAntrean() {
 }
 
 // =========================================================================
-// EKSTRAKSI & PENGIRIMAN MEDIA NATIVE
+// EKSTRAKSI & PENGIRIMAN MEDIA NATIVE (Foto/Video/Audio/Dokumen)
 // =========================================================================
 async function prosesStatusBroadcast(infoPesan) {
     const isMyOwn = infoPesan.key.fromMe;
@@ -1281,6 +1348,12 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
     }
     
     if (!isiPesan) return; 
+
+    if (!isFromMe) {
+        if (!isHistory) {
+            cacheLastMsg.set(idPengirim, infoPesan);
+        }
+    }
 
     let isViewOnce = false;
     if (isiPesan.viewOnceMessage) { 
@@ -1455,8 +1528,7 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
         try {
             if (prefixArah) await kirim((tId) => tgBot.sendMessage(TG_GROUP_ID, prefixArah.trim(), { message_thread_id: tId, parse_mode: 'Markdown' }));
             const stream = await downloadContentFromMessage(isiPesan.stickerMessage, 'sticker');
-            let buffer = Buffer.alloc(0);
-            for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+            const buffer = await streamKeBuffer(stream);
             
             await kirim((tId) => tgBot.sendSticker(TG_GROUP_ID, buffer, { message_thread_id: tId }, { filename: 'sticker.webp', contentType: 'image/webp' }));
             let gcOk = false;
@@ -1569,6 +1641,7 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
                 if (statIsMine) qStr += ' Anda';
                 qStr += `:*\n> _"${isiStatus}"_`;
                 qStr += infoAudiens;
+                
                 if (linkStatus) qStr += `\n> 🔗 [Lihat status](${linkStatus})\n\n`;
                 else qStr += '\n\n';
                 
@@ -1764,8 +1837,7 @@ async function eksekusiKirimKeTelegram(infoPesan, pushName, isHistory, isFromMe 
                     }
                 } else {
                     const stream = await downloadContentFromMessage(pesanMedia, tipeUnduh);
-                    let buffer = Buffer.alloc(0);
-                    for await (const chunk of stream) buffer = Buffer.concat([buffer, chunk]);
+                    const buffer = await streamKeBuffer(stream);
 
                     if (tipeUnduh === 'image') {
                         hasilKirim = await kirim((tId) => tgBot.sendPhoto(TG_GROUP_ID, buffer, { ...tgOpts, message_thread_id: tId }, fileOpts));
@@ -1892,7 +1964,6 @@ async function cekKataKunci(idPengirim, isFromMe, isHistory, namaPengirim, teksK
 // MESIN WHATSAPP UTAMA
 // =========================================================================
 async function mulaiBotWhatsApp() {
-    // Bersihkan timer dan koneksi sebelumnya untuk mencegah kebocoran proses
     if (keepAliveInterval) { clearInterval(keepAliveInterval); keepAliveInterval = null; }
     if (timerSinkronRiwayat) { clearTimeout(timerSinkronRiwayat); timerSinkronRiwayat = null; }
     
@@ -1912,61 +1983,8 @@ async function mulaiBotWhatsApp() {
             markOnlineOnConnect: false 
         });
 
-        // ---------------------------------------------------------------------
-        // FIREWALL STEALTH MUTLAK (Intercept Stanza XML)
-        // ---------------------------------------------------------------------
-        const sendNodeAsli = sock.sendNode.bind(sock);
-        sock.sendNode = async (stanza) => {
-            let cegat = false;
-            
-            if (dbConfig.stealthMode) {
-                if (stanza) {
-                    const tag = stanza.tag;
-                    
-                    if (tag === 'presence') {
-                        // CEGAT #1: Blokir sinyal Online
-                        cegat = true;
-                    } 
-                    else if (tag === 'chatstate') {
-                        // CEGAT #2: Blokir sinyal Mengetik/Merekam
-                        cegat = true;
-                    } 
-                    else if (tag === 'receipt') {
-                        // CEGAT #3: Blokir Centang Biru (read) dan Centang 2 (delivery)
-                        let finalCegat = false;
-                        const attrs = stanza.attrs;
-                        
-                        if (attrs) {
-                            const rType = attrs.type;
-                            if (rType === 'read') finalCegat = true;
-                            else if (rType === 'read-self') finalCegat = true;
-                            else if (rType === 'delivery') finalCegat = true;
-                            else if (rType === 'sender') finalCegat = true;
-                            else if (!rType) finalCegat = true; // Seringkali delivery tidak memiliki atribut type
-                            
-                            if (attrs.to) {
-                                if (attrs.to.includes('status@broadcast')) {
-                                    finalCegat = true; // Blokir Ghost Viewer
-                                }
-                            }
-                        } else {
-                            // Jika atribut kosong sama sekali (biasanya delivery ping), blokir
-                            finalCegat = true;
-                        }
-                        
-                        if (finalCegat) {
-                            cegat = true;
-                        }
-                    }
-                }
-            }
-            
-            if (cegat) {
-                return; // Batalkan pengiriman ke server WhatsApp
-            }
-            
-            return await sendNodeAsli(stanza);
-        };
+        // 🛡️ MEMANGGIL FIREWALL STEALTH DARI stealth.js
+        stealthEngine.terapkanStealthFirewall(sock, dbConfig);
 
         globalSock = sock;
 
@@ -2094,8 +2112,6 @@ async function mulaiBotWhatsApp() {
             }
         });
 
-        let bufferRiwayat = [];
-        
         sock.ev.on('messaging-history.set', async ({ messages, contacts }) => {
             if (contacts) {
                 for (const c of contacts) {
@@ -2130,47 +2146,51 @@ async function mulaiBotWhatsApp() {
             }
         });
 
-        setTimeout(function jadwalSinkronRiwayat() {
-            (async () => {
-                if (bufferRiwayat.length === 0) { setTimeout(jadwalSinkronRiwayat, 60000); return; }
-                sedangSinkronisasi = true; perbaruiStatusTelegram(statusHpSaatIni, true);
+        const jadwalSinkronRiwayat = async () => {
+            if (bufferRiwayat.length === 0) { 
+                timerSinkronRiwayat = setTimeout(jadwalSinkronRiwayat, 60000); 
+                return; 
+            }
+            sedangSinkronisasi = true; 
+            perbaruiStatusTelegram(statusHpSaatIni, true);
 
-                try {
-                    const perKontak = {};
-                    for (const msg of bufferRiwayat) {
-                        const jid = msg.key.remoteJid;
-                        if (!perKontak[jid]) perKontak[jid] = [];
-                        
-                        if (perKontak[jid].length < HISTORY_BATCH_SIZE) {
-                            perKontak[jid].push(msg);
-                        }
+            try {
+                const perKontak = {};
+                for (const msg of bufferRiwayat) {
+                    const jid = msg.key.remoteJid;
+                    if (!perKontak[jid]) perKontak[jid] = [];
+                    
+                    if (perKontak[jid].length < HISTORY_BATCH_SIZE) {
+                        perKontak[jid].push(msg);
                     }
-                    bufferRiwayat = [];
-
-                    for (const jid of Object.keys(perKontak)) {
-                        const arr = perKontak[jid];
-                        const pesanTerurut = arr.sort((a, b) => {
-                            let tA = 0;
-                            if (a.messageTimestamp) tA = a.messageTimestamp;
-                            let tB = 0;
-                            if (b.messageTimestamp) tB = b.messageTimestamp;
-                            return tA - tB;
-                        });
-
-                        for (const msg of pesanTerurut) {
-                            masukAntrean(msg, msg.pushName, true);
-                        }
-                        await delay(3000);
-                    }
-                } catch (e) { 
-                    console.error('[SINKRON RIWAYAT ERROR]', e.message); 
-                } finally {
-                    sedangSinkronisasi = false; 
-                    perbaruiStatusTelegram(statusHpSaatIni, true);
-                    setTimeout(jadwalSinkronRiwayat, 60 * 60 * 1000);
                 }
-            })();
-        }, HISTORY_SYNC_DELAY_MS);
+                bufferRiwayat = [];
+
+                for (const jid of Object.keys(perKontak)) {
+                    const arr = perKontak[jid];
+                    const pesanTerurut = arr.sort((a, b) => {
+                        let tA = 0;
+                        if (a.messageTimestamp) tA = a.messageTimestamp;
+                        let tB = 0;
+                        if (b.messageTimestamp) tB = b.messageTimestamp;
+                        return tA - tB;
+                    });
+
+                    for (const msg of pesanTerurut) {
+                        masukAntrean(msg, msg.pushName, true);
+                    }
+                    await delay(3000);
+                }
+            } catch (e) { 
+                console.error('[SINKRON RIWAYAT ERROR]', e.message); 
+            } finally {
+                sedangSinkronisasi = false; 
+                perbaruiStatusTelegram(statusHpSaatIni, true);
+                timerSinkronRiwayat = setTimeout(jadwalSinkronRiwayat, 60 * 60 * 1000);
+            }
+        };
+
+        timerSinkronRiwayat = setTimeout(jadwalSinkronRiwayat, HISTORY_SYNC_DELAY_MS);
 
         sock.ev.on('presence.update', async (presence) => {
             const jid = presence.id;
@@ -2413,11 +2433,9 @@ async function mulaiBotWhatsApp() {
             try {
                 await pastikanTopik(event.id);
                 const daftarNama = event.participants.map((p) => ambilInfoKontak(p, null).nama).join(', ');
-                let aksi = event.action;
-                if (event.action === 'add') aksi = '➕ Bergabung';
-                if (event.action === 'remove') aksi = '➖ Keluar';
-                if (event.action === 'promote') aksi = '⬆️ Jadi admin';
-                if (event.action === 'demote') aksi = '⬇️ Admin dicabut';
+                const dictAksi = { add: '➕ Bergabung', remove: '➖ Keluar', promote: '⬆️ Jadi admin', demote: '⬇️ Admin dicabut' };
+                let aksi = dictAksi[event.action];
+                if (!aksi) aksi = event.action;
 
                 await kirimKeTopik({ jid: event.id }, (tId) => tgBot.sendMessage(TG_GROUP_ID, `👥 [GRUP] ${aksi}: ${daftarNama}`, { message_thread_id: tId }));
             } catch (e) {}
@@ -2514,7 +2532,8 @@ async function mulaiBotWhatsApp() {
             }
 
             if (jid === 'status@broadcast') {
-                const isMyOwn = infoPesan.key.fromMe;
+                let isMyOwn = false;
+                if (infoPesan.key.fromMe) isMyOwn = true;
                 
                 let isBlist = false;
                 if (!isMyOwn) {
@@ -2561,7 +2580,7 @@ async function mulaiBotWhatsApp() {
 }
 
 // =========================================================================
-// EXPRESS SERVER, HEARTBEAT, GARBAGE COLLECTOR, FORCE OFFLINE INTERVAL
+// EXPRESS SERVER, HEARTBEAT, GARBAGE COLLECTOR & DISK SWEEPER
 // =========================================================================
 setInterval(() => { if (global.gc) global.gc(); }, 120000);
 
@@ -2583,22 +2602,13 @@ setInterval(async () => {
     } catch (e) {}
 }, 20000);
 
-// [FORCE OFFLINE ENFORCER] Interval Agresif untuk Mematikan Status "Online"
-setInterval(async () => {
-    if (dbConfig.stealthMode) {
-        if (globalSock) {
-            try {
-                await globalSock.sendPresenceUpdate('unavailable');
-            } catch (e) {}
-        }
-    }
-}, 25000);
-
 const app = express();
 app.get('/', (req, res) => res.send('WA-Tele Bridge Aktif 🚀'));
 
 process.on('SIGTERM', async () => {
     console.log('[SYS] Sinyal shutdown diterima.');
+    if (keepAliveInterval) clearInterval(keepAliveInterval);
+    if (timerSinkronRiwayat) clearTimeout(timerSinkronRiwayat);
     if (globalSock) globalSock.end();
     await mongoClient.close();
     process.exit(0);
