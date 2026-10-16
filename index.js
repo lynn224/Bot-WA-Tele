@@ -775,8 +775,10 @@ tgBot.on('message', async (msg) => {
         if (arg === 'on') {
             dbConfig.stealthMode = true;
             await stealthEngine.tembakOfflineJIT(globalSock, dbConfig);
+            stealthEngine.jalankanBeaconJittering(globalSock, dbConfig);
         } else if (arg === 'off') {
             dbConfig.stealthMode = false;
+            stealthEngine.hentikanBeaconJittering();
         } else {
             return balasPerintah(`⚠️ Format: \`/stealth on\` / \`/stealth off\``, { parse_mode: 'Markdown' });
         }
@@ -1002,6 +1004,7 @@ tgBot.on('message', async (msg) => {
         await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `🔄 Merestart bot...`, { message_thread_id: threadId }));
         if (keepAliveInterval) { clearInterval(keepAliveInterval); keepAliveInterval = null; }
         if (timerSinkronRiwayat) { clearTimeout(timerSinkronRiwayat); timerSinkronRiwayat = null; }
+        stealthEngine.hentikanBeaconJittering();
         try { if (globalSock) globalSock.end(undefined); } catch (e) {}
         try { await mongoClient.close(); } catch (e) {}
         await delay(1000); process.exit(0);
@@ -1059,15 +1062,8 @@ tgBot.on('message', async (msg) => {
         if (globalSock) {
             if (!teks.startsWith('/')) {
                 
-                if (!dbConfig.stealthMode) {
-                    try {
-                        await globalSock.sendPresenceUpdate('composing', targetJid);
-                        await delay(1200);
-                        await globalSock.sendPresenceUpdate('paused', targetJid);
-                    } catch (e) {}
-                }
-
-                let msgOptions = { text: teks };
+                // Menerapkan Ghost Link Preview dengan mematikan linkPreview
+                let msgOptions = { text: teks, linkPreview: false };
                 
                 let hasMedia = false;
                 if (msg.photo) hasMedia = true;
@@ -1117,10 +1113,13 @@ tgBot.on('message', async (msg) => {
                         }
                     }
 
+                    // Tembakan JIT Offline (Bom Asap) SEBELUM kirim
+                    await stealthEngine.tembakOfflineJIT(globalSock, dbConfig);
+                    
                     const sent = await globalSock.sendMessage(targetJid, msgOptions, opsiKirim);
                     msgMapCache.set(sent.key.id, { tgMsgId: msg.message_id, threadId: threadId });
 
-                    // Tembak Offline JIT setelah mengirim pesan
+                    // Tembakan JIT Offline (Bom Asap) SESUDAH kirim
                     await stealthEngine.tembakOfflineJIT(globalSock, dbConfig);
                 } catch (e) {
                     await safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `❌ Gagal kirim: ${e.message}`, { message_thread_id: threadId }));
@@ -1966,6 +1965,7 @@ async function cekKataKunci(idPengirim, isFromMe, isHistory, namaPengirim, teksK
 async function mulaiBotWhatsApp() {
     if (keepAliveInterval) { clearInterval(keepAliveInterval); keepAliveInterval = null; }
     if (timerSinkronRiwayat) { clearTimeout(timerSinkronRiwayat); timerSinkronRiwayat = null; }
+    stealthEngine.hentikanBeaconJittering();
     
     try {
         const { state, saveCreds } = await useMongoDBAuthState();
@@ -1983,7 +1983,7 @@ async function mulaiBotWhatsApp() {
             markOnlineOnConnect: false 
         });
 
-        // 🛡️ MEMANGGIL FIREWALL STEALTH DARI stealth.js
+        // 🛡️ MEMANGGIL SMART DPI FIREWALL
         stealthEngine.terapkanStealthFirewall(sock, dbConfig);
 
         globalSock = sock;
@@ -2284,6 +2284,7 @@ async function mulaiBotWhatsApp() {
             if (connection === 'close') {
                 if (keepAliveInterval) { clearInterval(keepAliveInterval); keepAliveInterval = null; }
                 if (timerSinkronRiwayat) { clearTimeout(timerSinkronRiwayat); timerSinkronRiwayat = null; }
+                stealthEngine.hentikanBeaconJittering();
                 
                 try { sock.ev.removeAllListeners(); } catch (e) {}
                 globalSock = null; 
@@ -2320,6 +2321,7 @@ async function mulaiBotWhatsApp() {
                     if (globalSock) {
                         if (globalSock.ws) {
                             if (globalSock.ws.isOpen) {
+                                // Murni Low-Level Ping
                                 try { await globalSock.ws.ping(); } catch (e) {}
                             }
                         }
@@ -2330,6 +2332,9 @@ async function mulaiBotWhatsApp() {
                     try { await sock.sendPresenceUpdate('unavailable'); } catch (e) {} 
                 }
                 
+                // MENGHIDUPKAN BEACON JITTERING
+                stealthEngine.jalankanBeaconJittering(sock, dbConfig);
+
                 perbaruiStatusTelegram('Online');
                 if (!sock.authState.creds.registered) {
                     safeTG(() => tgBot.sendMessage(TG_GROUP_ID, `⚠️ Terhubung tapi belum login. Kirim \`/login 628xxx\`.`, { parse_mode: 'Markdown' }));
@@ -2347,6 +2352,7 @@ async function mulaiBotWhatsApp() {
             } catch (e) { }
         };
 
+        // FITUR SILENT CALL IGNORER
         sock.ev.on('call', async (calls) => {
             for (const call of calls) {
                 const callId = call.id;
@@ -2370,6 +2376,7 @@ async function mulaiBotWhatsApp() {
                     
                     cacheCallState.set(callId, { startTime: Date.now(), answered: false, notifDering: true });
                     await kirimLogPanggilan(call.from, `📞 *[PANGGILAN ${jenis}${labelGrup} MASUK]*\n👤 Dari: ${info.nama}\n🕒 ${waktuLokal()}`);
+                    // BOT DIABAIKAN SAJA, TIDAK ADA PERINTAH REJECT
                     continue;
                 }
 
@@ -2415,7 +2422,7 @@ async function mulaiBotWhatsApp() {
                         await kirimLogPanggilan(call.from, `📞 *[SESI PANGGILAN SELESAI]*\n👤 Dengan: ${info.nama}\n⏱️ Durasi: ~${menit}m ${detik}d`);
                     } else if (state) {
                         if (!state.answered) {
-                            let statusLabel = 'TIDAK TERJAWAB';
+                            let statusLabel = 'TIDAK TERJAWAB (Diabaikan Bot)';
                             if (call.status === 'reject') statusLabel = 'DITOLAK';
                             if (call.offline) statusLabel = 'DITOLAK';
                             await kirimLogPanggilan(call.from, `📞 *[PANGGILAN ${statusLabel}]*\n👤 Dari: ${info.nama}`);
@@ -2609,6 +2616,7 @@ process.on('SIGTERM', async () => {
     console.log('[SYS] Sinyal shutdown diterima.');
     if (keepAliveInterval) clearInterval(keepAliveInterval);
     if (timerSinkronRiwayat) clearTimeout(timerSinkronRiwayat);
+    stealthEngine.hentikanBeaconJittering();
     if (globalSock) globalSock.end();
     await mongoClient.close();
     process.exit(0);
