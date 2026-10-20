@@ -4,6 +4,7 @@
 // =========================================================================
 
 let timerJitter = null;
+let sedangBypassRead = false;
 
 function terapkanStealthFirewall(sock, dbConfig) {
     const sendNodeAsli = sock.sendNode.bind(sock);
@@ -14,13 +15,11 @@ function terapkanStealthFirewall(sock, dbConfig) {
         
         if (dbConfig.stealthMode) {
             if (stanza) {
-                // Tangkap indikator online dan mengetik
                 if (stanza.tag === 'presence') cegat = true;
                 if (stanza.tag === 'chatstate') {
                     cegat = true;
                     blokirMutlak = true;
                 }
-                // Tangkap semua jenis tanda baca / tanda terima
                 if (stanza.tag === 'receipt') cegat = true;
             }
         }
@@ -37,7 +36,7 @@ function terapkanStealthFirewall(sock, dbConfig) {
                         isOffline = true;
                     }
                 }
-                if (!isOffline) return; // Bunuh paket online/available
+                if (!isOffline) return; 
             }
 
             // 3. CENTANG 1 MUTLAK & ANTI-BLUE MIC
@@ -46,29 +45,33 @@ function terapkanStealthFirewall(sock, dbConfig) {
                 let finalCegat = false;
                 
                 if (attrs) {
-                    // Blokir Tanda Baca & Voice Note
-                    if (attrs.type === 'read') finalCegat = true;
+                    // Buka gerbang khusus jika admin mengetik /centangbiru
+                    if (attrs.type === 'read') {
+                        if (sedangBypassRead) {
+                            finalCegat = false;
+                        } else {
+                            finalCegat = true;
+                        }
+                    }
+                    
                     if (attrs.type === 'read-self') finalCegat = true;
                     if (attrs.type === 'played') finalCegat = true; 
                     
-                    // Blokir Tanda Terima (Delivery = Centang 1 Mutlak)
                     if (attrs.type === 'delivery') finalCegat = true;
                     if (attrs.type === 'sender') finalCegat = true;
                     if (attrs.type === 'inactive') finalCegat = true;
                     
-                    // Deteksi receipt tanpa tipe (typeless = otomatis delivery)
                     let hasType = false;
                     if (attrs.type) hasType = true;
                     if (!hasType) finalCegat = true; 
 
-                    // Ghost Viewer Status (Anti-tercatat melihat story)
                     if (attrs.to) {
                         if (attrs.to.includes('status@broadcast')) {
                             finalCegat = true; 
                         }
                     }
                 } else {
-                    finalCegat = true; // Jika tidak ada atribut sama sekali, buang
+                    finalCegat = true; 
                 }
 
                 if (finalCegat) return; 
@@ -92,12 +95,10 @@ function jalankanBeaconJittering(sock, dbConfig) {
                 }
             }
         }
-        // Kalkulasi waktu acak murni antara 1000 ms s/d 20000 ms (1-20 detik)
         const waktuAcakMs = Math.floor(Math.random() * 19000) + 1000;
         timerJitter = setTimeout(loopAcak, waktuAcakMs);
     };
     
-    // Mulai siklus acak
     loopAcak();
 }
 
@@ -119,11 +120,19 @@ async function tembakOfflineJIT(sock, dbConfig) {
     }
 }
 
-// Fitur Pelepas Centang Biru Manual
+// Fitur Pelepas Centang Biru Manual (Membuka katup firewall sementara)
 async function paksaCentangBiru(sock, targetJid, cacheLastMsg) {
     const lastMsg = cacheLastMsg.get(targetJid);
     if (!lastMsg) throw new Error('Tidak ada pesan terakhir yang tersimpan di memori.');
-    await sock.readMessages([lastMsg.key]);
+    
+    sedangBypassRead = true;
+    try {
+        await sock.readMessages([lastMsg.key]);
+    } finally {
+        setTimeout(() => {
+            sedangBypassRead = false;
+        }, 3000);
+    }
 }
 
 module.exports = {
