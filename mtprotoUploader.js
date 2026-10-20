@@ -1,3 +1,7 @@
+// =========================================================================
+// MTPROTO UPLOADER (Bypass Batas 50MB Telegram hingga 2GB)
+// =========================================================================
+
 const { TelegramClient, Api } = require('telegram');
 const { StringSession } = require('telegram/sessions');
 const { CustomFile } = require('telegram/client/uploads');
@@ -7,14 +11,23 @@ let mtprotoClient = null;
 let isConnected = false;
 
 async function inisialisasiMTProto(configCollection, apiId, apiHash, botToken) {
-    if (!apiId || !apiHash) {
+    let kredensialKurang = false;
+    if (!apiId) kredensialKurang = true;
+    if (!apiHash) kredensialKurang = true;
+
+    if (kredensialKurang) {
         console.warn('⚠️ [MTProto] TG_API_ID atau TG_API_HASH belum diatur.');
         return false;
     }
 
     try {
         const docConfig = await configCollection.findOne({ _id: 'global_settings' });
-        const savedSession = docConfig?.tg_mtproto_bot_session || '';
+        let savedSession = '';
+        if (docConfig) {
+            if (docConfig.tg_mtproto_bot_session) {
+                savedSession = docConfig.tg_mtproto_bot_session;
+            }
+        }
         const stringSession = new StringSession(savedSession);
 
         mtprotoClient = new TelegramClient(stringSession, Number(apiId), apiHash, {
@@ -51,8 +64,12 @@ async function inisialisasiMTProto(configCollection, apiId, apiHash, botToken) {
     }
 }
 
-async function uploadBesarMTProto(filePath, namaFile, mimeType, caption, targetGroupId, threadId) {
-    if (!isConnected || !mtprotoClient) {
+async function uploadBesarMTProto(filePath, namaFile, mimeType, caption, targetGroupId, threadId, replyToMsgId) {
+    let belumSiap = false;
+    if (!isConnected) belumSiap = true;
+    if (!mtprotoClient) belumSiap = true;
+
+    if (belumSiap) {
         throw new Error("Koneksi MTProto belum siap atau gagal.");
     }
 
@@ -74,15 +91,20 @@ async function uploadBesarMTProto(filePath, namaFile, mimeType, caption, targetG
 
     const inputPeer = await mtprotoClient.getInputEntity(targetGroupId);
 
+    let teksCaption = '';
+    if (caption) teksCaption = caption;
+
     const sendOptions = {
         file: fileHandle,
-        caption: caption || '',
+        caption: teksCaption,
         attributes: [
             new Api.DocumentAttributeFilename({ fileName: namaFile })
         ]
     };
 
-    if (threadId) {
+    if (replyToMsgId) {
+        sendOptions.replyTo = Number(replyToMsgId);
+    } else if (threadId) {
         sendOptions.replyTo = Number(threadId);
     }
 
