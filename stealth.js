@@ -28,15 +28,18 @@ function terapkanStealthFirewall(sock, dbConfig) {
             // 1. BLOKIR CHATSTATE (Anti-Mengetik / Merekam)
             if (blokirMutlak) return; 
 
-            // 2. SMART DPI PRESENCE (Hanya izinkan 'unavailable' lewat)
+            // 2. SMART DPI PRESENCE (Izinkan 'unavailable' & 'subscribe' mengintip target)
             if (stanza.tag === 'presence') {
-                let isOffline = false;
+                let izinkan = false;
                 if (stanza.attrs) {
                     if (stanza.attrs.type === 'unavailable') {
-                        isOffline = true;
+                        izinkan = true;
+                    }
+                    if (stanza.attrs.type === 'subscribe') {
+                        izinkan = true;
                     }
                 }
-                if (!isOffline) return; 
+                if (!izinkan) return; 
             }
 
             // 3. CENTANG 1 MUTLAK & ANTI-BLUE MIC
@@ -45,7 +48,6 @@ function terapkanStealthFirewall(sock, dbConfig) {
                 let finalCegat = false;
                 
                 if (attrs) {
-                    // Buka gerbang khusus jika admin mengetik /centangbiru
                     if (attrs.type === 'read') {
                         if (sedangBypassRead) {
                             finalCegat = false;
@@ -120,7 +122,7 @@ async function tembakOfflineJIT(sock, dbConfig) {
     }
 }
 
-// Fitur Pelepas Centang Biru Manual (Membuka katup firewall sementara)
+// Fitur Pelepas Centang Biru Manual
 async function paksaCentangBiru(sock, targetJid, cacheLastMsg) {
     const lastMsg = cacheLastMsg.get(targetJid);
     if (!lastMsg) throw new Error('Tidak ada pesan terakhir yang tersimpan di memori.');
