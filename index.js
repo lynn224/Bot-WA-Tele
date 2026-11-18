@@ -50,7 +50,7 @@ function waktuLokal(date = new Date()) {
     return date.toLocaleString('id-ID', { timeZone: ZONA_WAKTU });
 }
 const HISTORY_BATCH_SIZE = 30;
-const BATAS_JALUR_BERAT_BYTES = 15 * 1024 * 1024; // 15 MB ke atas masuk Jalur 3 (Alat Berat)
+const BATAS_JALUR_BERAT_BYTES = 15 * 1024 * 1024; 
 
 const tgBot = new TelegramBot(TG_TOKEN, {
     polling: { params: { allowed_updates: JSON.stringify(['message', 'message_reaction']) } }
@@ -64,7 +64,7 @@ tgBot.setMyCommands([
     { command: 'centangbiru', description: 'Ubah pesan target jadi centang biru' },
     { command: 'setmedia', description: 'Atur batas ukuran media (MB)' },
     { command: 'mystatus', description: 'Laporan viewer status Anda' },
-    { command: 'info', description: 'Detail kontak topik ini' },
+    { command: 'info', description: 'Detail & Status Online Real-time kontak' },
     { command: 'mute', description: 'Bisukan topik ini' },
     { command: 'unmute', description: 'Bunyikan topik ini' },
     { command: 'login', description: 'Tautkan/ganti nomor WA' },
@@ -133,10 +133,6 @@ let sedangSinkronisasi = false;
 
 // =========================================================================
 // ARSITEKTUR MULTI-LANE QUEUE (4 JALUR PEKERJA MANDIRI)
-// Jalur 1 (VIP Teks): Langsung dieksekusi tanpa antrean
-// Jalur 2 (Media Ringan <15MB): antreanMediaRingan
-// Jalur 3 (Media Berat >=15MB): antreanMediaBerat (Strict 1 per 1)
-// Jalur 4 (Story WA): antreanStatus
 // =========================================================================
 const antreanMediaRingan = [];
 const antreanMediaBerat = [];
@@ -356,7 +352,6 @@ async function ambilPemetaanReply(tgMsgId) {
     }
 }
 
-// Fungsi Menyimpan Tugas Media ke MongoDB
 async function catatTugasKeDB(taskObj) {
     if (!pendingTasksCollection) return;
     try {
@@ -371,7 +366,6 @@ async function catatTugasKeDB(taskObj) {
     }
 }
 
-// Fungsi Menghapus Tugas Media setelah Selesai
 async function hapusTugasDariDB(idPesan) {
     if (!pendingTasksCollection) return;
     try {
@@ -379,7 +373,6 @@ async function hapusTugasDariDB(idPesan) {
     } catch (e) {}
 }
 
-// Fungsi Memulihkan Antrean yang Tertunda saat Server Baru Menyala
 async function pulihkanTugasTertunda() {
     if (!pendingTasksCollection) return;
     try {
@@ -822,7 +815,7 @@ tgBot.on('message', async (msg) => {
     };
 
     if (cmd === '/help') {
-        const help = `🛠️ *MENU COMMAND*\n\n*Umum* (di 📌 Perintah Bot):\n/status - Diagnostik server & antrean\n/stealth [on/off] - Mode hantu\n/centangbiru - Ubah pesan target jadi centang biru\n/setmedia [MB] - Set batas media\n/mystatus - Laporan viewer status Anda\n/online - Status online semua kontak\n/restart - Restart bot\n/login [nomor] - Tautkan nomor WA\n\n*Kata Kunci*:\n/addkata, /listkata, /delkata, /blacklistkata, /unblacklistkata\n\n*Status WA*:\n/nostatus, /yesstatus\n\n*Topik Kontak*:\n/info, /mute, /unmute, /hapustopik\n\n*Lainnya*:\n/hapussemuatopik konfirmasi - Hapus semua topik\n\n💬 Ketik langsung di topik untuk kirim pesan. Pakai Reply Telegram untuk membalas pesan spesifik.`;
+        const help = `🛠️ *MENU COMMAND*\n\n*Umum* (di 📌 Perintah Bot):\n/status - Diagnostik server & antrean\n/stealth [on/off] - Mode hantu\n/centangbiru - Ubah pesan target jadi centang biru\n/setmedia [MB] - Set batas media\n/mystatus - Laporan viewer status Anda\n/online - Status online semua kontak\n/restart - Restart bot\n/login [nomor] - Tautkan nomor WA\n\n*Kata Kunci*:\n/addkata, /listkata, /delkata, /blacklistkata, /unblacklistkata\n\n*Status WA*:\n/nostatus, /yesstatus\n\n*Topik Kontak*:\n/info - Detail & Status Online Real-time kontak\n/mute, /unmute, /hapustopik\n\n*Lainnya*:\n/hapussemuatopik konfirmasi - Hapus semua topik\n\n💬 Ketik langsung di topik untuk kirim pesan. Pakai Reply Telegram untuk membalas pesan spesifik.`;
         return balasPerintah(help, { parse_mode: 'Markdown' });
     }
 
@@ -903,49 +896,62 @@ tgBot.on('message', async (msg) => {
         return balasPerintah(`✅ Batas media diperbarui: *${mb} MB*`, { parse_mode: 'Markdown' });
     }
 
+    // COMMAND INFO DENGAN REAL-TIME STATUS
     if (cmd === '/info') {
         if (!targetJid) return balasPerintah(`⚠️ Jalankan di dalam topik kontak.`);
         const info = ambilInfoKontak(targetJid, null);
         let ketLid = '';
         if (info.nomor === 'Disembunyikan (LID)') ketLid = '\n_(Komunitas/Saluran WA)_';
         
-        let statusOnline = cacheCurrentStatus.get(targetJid);
-        if (!statusOnline) statusOnline = '❔ Belum diketahui';
+        let idTampil = info.pnJid;
+        if (!idTampil) idTampil = targetJid;
+
+        if (!info.isGrup) {
+            if (globalSock) {
+                try {
+                    await globalSock.presenceSubscribe(idTampil);
+                    await delay(1200); 
+                } catch (e) {}
+            }
+        }
+        
+        let statusOnline = cacheCurrentStatus.get(idTampil);
+        if (!statusOnline) statusOnline = cacheCurrentStatus.get(targetJid);
+        if (!statusOnline) statusOnline = '🔴 Offline / Diprivasi';
         
         let terakhirTerlihat = '';
-        if (statusOnline === '🔴 Offline') {
-            const lsWaktu = cacheLastSeen.get(targetJid);
-            if (lsWaktu) terakhirTerlihat = `\n🕒 Terakhir terlihat: ${waktuLokal(new Date(lsWaktu))}`;
+        if (statusOnline.includes('Offline')) {
+            let lsWaktu = cacheLastSeen.get(idTampil);
+            if (!lsWaktu) lsWaktu = cacheLastSeen.get(targetJid);
+            
+            if (lsWaktu) {
+                terakhirTerlihat = `\n🕒 Terakhir terlihat: ${waktuLokal(new Date(lsWaktu))}`;
+            } else {
+                terakhirTerlihat = `\n🕒 Terakhir terlihat: _(Tidak tersedia / Diprivasi)_`;
+            }
         }
 
         let bio = '';
         if (!info.isGrup) {
             if (globalSock) {
                 try {
-                    let targetBio = info.pnJid;
-                    if (!targetBio) targetBio = targetJid;
-                    const st = await globalSock.fetchStatus(targetBio);
+                    const st = await globalSock.fetchStatus(idTampil);
                     if (st) {
                         if (st.status) bio = `\n📝 Bio: ${st.status}`;
                     }
                 } catch (e) { }
             }
         }
-
-        let idTampil = info.pnJid;
-        if (!idTampil) idTampil = targetJid;
         
         let displayNomor = 'LID';
         if (info.nomor !== 'Disembunyikan (LID)') displayNomor = '+' + info.nomor;
 
-        const teksInfo = `ℹ️ *DETAIL KONTAK*\n\n👤 Nama: ${info.nama}\n📞 Nomor: \`${displayNomor}\`\n💬 Tipe: ${info.isGrup ? 'Grup' : 'Pribadi'}\n🟢 Status: ${statusOnline}${terakhirTerlihat}${bio}\n🆔 JID: \`${idTampil}\`${ketLid}`;
+        const teksInfo = `ℹ️ *DETAIL KONTAK*\n\n👤 Nama: ${info.nama}\n📞 Nomor: \`${displayNomor}\`\n💬 Tipe: ${info.isGrup ? 'Grup' : 'Pribadi'}\n📶 Status: ${statusOnline}${terakhirTerlihat}${bio}\n🆔 JID: \`${idTampil}\`${ketLid}`;
 
         let fotoUrl = null;
         if (globalSock) {
             try { 
-                let targetPic = info.pnJid;
-                if (!targetPic) targetPic = targetJid;
-                fotoUrl = await globalSock.profilePictureUrl(targetPic, 'image'); 
+                fotoUrl = await globalSock.profilePictureUrl(idTampil, 'image'); 
             } catch (e) { }
         }
 
@@ -1260,7 +1266,6 @@ tgBot.on('message_reaction', async (reaction) => {
 // =========================================================================
 
 async function distribusiPesanMasuk(infoPesan, pushName = 'Kontak', isHistory = false, isFromMe = false) {
-    // Ekstrak isi pesan untuk melihat apakah ini Teks (Jalur 1) atau Media (Jalur 2/3)
     let isiPesan = infoPesan.message;
     if (isiPesan) {
         if (isiPesan.ephemeralMessage) isiPesan = isiPesan.ephemeralMessage.message;
@@ -1285,7 +1290,6 @@ async function distribusiPesanMasuk(infoPesan, pushName = 'Kontak', isHistory = 
         if (!pesanMedia) pesanMedia = isiPesan.stickerMessage;
     }
 
-    // JALUR 1: VIP EXPRESS (Teks, Lokasi, Kontak, Reaksi, ViewOnce, atau Riwayat Teks)
     if (!pesanMedia) {
         eksekusiJalurVIP(infoPesan, pushName, isHistory, isFromMe).catch((e) => {
             console.error('[JALUR VIP ERROR]', e.message);
@@ -1293,7 +1297,6 @@ async function distribusiPesanMasuk(infoPesan, pushName = 'Kontak', isHistory = 
         return;
     }
 
-    // Jika pesan adalah Sticker, langsung masukkan ke Jalur 2 tanpa Placeholder
     if (isiPesan.stickerMessage) {
         const taskSticker = {
             idPesan: infoPesan.key.id,
@@ -1309,13 +1312,11 @@ async function distribusiPesanMasuk(infoPesan, pushName = 'Kontak', isHistory = 
         return;
     }
 
-    // Hitung ukuran media untuk menentukan Jalur 2 (Ringan) atau Jalur 3 (Berat)
     let ukuranBytes = 0;
     if (pesanMedia.fileLength) ukuranBytes = parseInt(pesanMedia.fileLength, 10);
 
     const batasMaxBytes = dbConfig.maxMediaMB * 1024 * 1024;
     if (ukuranBytes > batasMaxBytes) {
-        // Jika melebihi batas maksimal settingan bot, kirim pemberitahuan via Jalur VIP
         eksekusiJalurVIP(infoPesan, pushName, isHistory, isFromMe).catch(() => {});
         return;
     }
@@ -1325,7 +1326,6 @@ async function distribusiPesanMasuk(infoPesan, pushName = 'Kontak', isHistory = 
         kategoriJalur = 'berat';
     }
 
-    // Buat Pesan Bayangan (Placeholder) via Jalur VIP terlebih dahulu agar urutan chat terkunci!
     let placeholderMsgId = null;
     try {
         placeholderMsgId = await kirimPlaceholderMedia(infoPesan, pushName, isHistory, isFromMe, ukuranBytes);
@@ -1341,7 +1341,6 @@ async function distribusiPesanMasuk(infoPesan, pushName = 'Kontak', isHistory = 
         placeholderMsgId
     };
 
-    // Simpan ke MongoDB agar tahan banting jika server restart/mati mendadak
     await catatTugasKeDB(taskMedia);
 
     if (kategoriJalur === 'berat') {
@@ -1353,7 +1352,6 @@ async function distribusiPesanMasuk(infoPesan, pushName = 'Kontak', isHistory = 
     }
 }
 
-// PEKERJA JALUR 2: MEDIA RINGAN (< 15 MB)
 async function pemicuPekerjaMediaRingan() {
     if (pekerjaRinganAktif) return;
     pekerjaRinganAktif = true;
@@ -1378,7 +1376,6 @@ async function pemicuPekerjaMediaRingan() {
     }
 }
 
-// PEKERJA JALUR 3: ALAT BERAT (>= 15 MB, Strict Sequential 1 per 1)
 async function pemicuPekerjaMediaBerat() {
     if (pekerjaBeratAktif) return;
     pekerjaBeratAktif = true;
@@ -1401,7 +1398,6 @@ async function pemicuPekerjaMediaBerat() {
     }
 }
 
-// PEKERJA JALUR 4: BACKGROUND STORY WA
 async function pemicuPekerjaStatus() {
     if (pekerjaStatusAktif) return;
     pekerjaStatusAktif = true;
@@ -1413,7 +1409,7 @@ async function pemicuPekerjaStatus() {
             } catch (e) {
                 console.error('[PEKERJA STATUS ERROR]', e.message);
             }
-            await delay(2000); // Jeda santai agar tidak kena Rate Limit
+            await delay(2000); 
         }
     } finally {
         pekerjaStatusAktif = false;
@@ -1425,7 +1421,6 @@ async function pemicuPekerjaStatus() {
 // EKSEKUSI PENGIRIMAN PER JALUR
 // =========================================================================
 
-// Fungsi pembuat format header / kutipan pesan
 function rakitKonteksPesan(infoPesan, isiPesan, pushName, isHistory, isFromMe) {
     const idPengirim = infoPesan.key.remoteJid;
     let awalan = '';
@@ -1614,7 +1609,6 @@ function rakitKonteksPesan(infoPesan, isiPesan, pushName, isHistory, isFromMe) {
     };
 }
 
-// PENGIRIM PESAN BAYANGAN (PLACEHOLDER) SECARA INSTAN
 async function kirimPlaceholderMedia(infoPesan, pushName, isHistory, isFromMe, ukuranBytes) {
     const idPengirim = infoPesan.key.remoteJid;
     if (dbConfig.muted.includes(idPengirim)) return null;
@@ -1669,7 +1663,6 @@ async function kirimPlaceholderMedia(infoPesan, pushName, isHistory, isFromMe, u
     return null;
 }
 
-// EKSEKUTOR JALUR 2 & 3 (UNDUH & KIRIM MEDIA, LALU HAPUS PLACEHOLDER ATAU REPLY)
 async function eksekusiUnduhKirimMedia(task) {
     const { infoPesan, pushName, isHistory, isFromMe, placeholderMsgId } = task;
     const idPengirim = infoPesan.key.remoteJid;
@@ -1681,7 +1674,6 @@ async function eksekusiUnduhKirimMedia(task) {
     if (isiPesan.ephemeralMessage) isiPesan = isiPesan.ephemeralMessage.message;
     if (isiPesan.documentWithCaptionMessage) isiPesan = isiPesan.documentWithCaptionMessage.message;
 
-    // Penanganan Khusus Stiker
     if (isiPesan.stickerMessage) {
         try {
             const ctx = rakitKonteksPesan(infoPesan, isiPesan, pushName, isHistory, isFromMe);
@@ -1847,7 +1839,6 @@ async function eksekusiUnduhKirimMedia(task) {
             }
         }
 
-        // Jika pengiriman media sukses, hapus pesan placeholder agar rapi, atau perbarui mapping ID
         if (hasilKirim) {
             if (hasilKirim.message_id) {
                 simpanPemetaanReply(hasilKirim.message_id, { waJid: idPengirim, waMsg: { key: infoPesan.key, message: infoPesan.message } });
@@ -1873,7 +1864,6 @@ async function eksekusiUnduhKirimMedia(task) {
     }
 }
 
-// EKSEKUTOR JALUR 1: VIP EXPRESS (REAL-TIME 0 DELAY)
 async function eksekusiJalurVIP(infoPesan, pushName, isHistory, isFromMe = false) {
     const idPengirim = infoPesan.key.remoteJid;
     if (dbConfig.muted.includes(idPengirim)) return;
@@ -2058,7 +2048,6 @@ async function eksekusiJalurVIP(infoPesan, pushName, isHistory, isFromMe = false
 
     cacheAntiDelete.set(infoPesan.key.id, { teks: ctx.teksKonten, tipe: ctx.tipePesan, pengirim: ctx.namaPengirimFinal, isGrup: ctx.infoUtama.isGrup });
 
-    // Cek apabila ini media yang ditolak karena melebihi batas maxMediaMB
     let pesanMedia = isiPesan.imageMessage;
     if (!pesanMedia) pesanMedia = isiPesan.videoMessage;
     if (!pesanMedia) pesanMedia = isiPesan.documentMessage;
@@ -2087,7 +2076,6 @@ async function eksekusiJalurVIP(infoPesan, pushName, isHistory, isFromMe = false
     }
 }
 
-// EKSEKUTOR JALUR 4: STATUS WA / STORY
 async function prosesStatusBroadcast(infoPesan) {
     const isMyOwn = infoPesan.key.fromMe;
     let statusMsg = infoPesan.message;
@@ -2486,11 +2474,14 @@ async function mulaiBotWhatsApp() {
             const jid = presence.id;
             const kList = Object.keys(presence.presences);
             let state = '';
+            let serverLastSeen = null;
+
             if (kList.length > 0) {
                 const kPertama = kList[0];
                 const obj = presence.presences[kPertama];
                 if (obj) {
                     if (obj.lastKnownPresence) state = obj.lastKnownPresence;
+                    if (obj.lastSeen) serverLastSeen = obj.lastSeen * 1000;
                 }
             }
 
@@ -2500,10 +2491,16 @@ async function mulaiBotWhatsApp() {
                 cacheLastSeen.del(jid); 
             } else if (state === 'composing') {
                 icon = '✍️ Mengetik...';
+                cacheLastSeen.del(jid);
             } else if (state === 'recording') {
                 icon = '🎤 Merekam suara...';
+                cacheLastSeen.del(jid);
             } else {
-                cacheLastSeen.set(jid, Date.now());
+                if (serverLastSeen) {
+                    cacheLastSeen.set(jid, serverLastSeen);
+                } else if (!cacheLastSeen.has(jid)) {
+                    cacheLastSeen.set(jid, Date.now());
+                }
             }
             
             cacheCurrentStatus.set(jid, icon); 
@@ -2797,7 +2794,6 @@ async function mulaiBotWhatsApp() {
 
         sock.ev.on('chats.delete', () => console.log('[INFO] chats.delete diabaikan sengaja'));
 
-        // PERBAIKAN BUG BATCH UPSERT: Memproses seluruh array chatUpdate.messages
         sock.ev.on('messages.upsert', async (chatUpdate) => {
             if (!chatUpdate.messages) return;
 
@@ -2832,7 +2828,6 @@ async function mulaiBotWhatsApp() {
                     continue; 
                 }
 
-                // JALUR 4: STORY WA
                 if (jid === 'status@broadcast') {
                     let isMyOwn = false;
                     if (infoPesan.key.fromMe) isMyOwn = true;
